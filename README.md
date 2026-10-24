@@ -1,5 +1,7 @@
 # sapi
 
+[![ci](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml/badge.svg)](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml)
+
 **The [pi](https://github.com/badlogic/pi-mono) coding agent, isolated in Docker, scoped to the directory you run it from.**
 
 ```sh
