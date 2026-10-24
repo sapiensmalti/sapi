@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# sapi — the pi coding agent, isolated in Docker, scoped to the directory you run it from.
+# https://github.com/sapiensmalti/sapi
+#
+# One file. No dependencies beyond bash, docker and coreutils.
+set -Eeuo pipefail
+
+readonly SAPI_VERSION="0.1.0"
+readonly SAPI_REPO="${SAPI_REPO:-sapiensmalti/sapi}"
+readonly SAPI_REF="${SAPI_REF:-main}"
+readonly IMAGE_REPOSITORY="sapi"
+readonly CONFIG_VOLUME="${SAPI_CONFIG_VOLUME:-sapi-config}"
+readonly LABEL="sh.sapi"
+
+# ---------------------------------------------------------------------------
+# Image definition. Embedded so that `sapi` is a single file.
+# Print it with `sapi dockerfile`.
+# ---------------------------------------------------------------------------
+read -r -d '' DOCKERFILE <<'DOCKERFILE_EOF' || true
+# syntax=docker/dockerfile:1
+FROM node:24-bookworm-slim
+
+ARG PI_VERSION=latest
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TERM=xterm-256color \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates curl git jq less openssh-client procps ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && git config --system --add safe.directory '*' \
+    && mkdir -p /home/sapi /pi-config /pi-sessions
+
+RUN npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+    && npm cache clean --force \
+    && pi --version
+
+# uv gives the agent Python without touching the host. Two static binaries.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Entrypoint: optional self-update, then drop to the host user (Linux) so files
+# written to /workspace are owned by you, not root.
+COPY <<'ENTRYPOINT_EOF' /usr/local/bin/sapi-entrypoint
+#!/bin/bash
+set -eu
+if [ "${SAPI_AUTO_UPDATE:-1}" = "1" ]; then
+    pi update self --no-approve >&2 \
+        || printf 'sapi: pi update failed; using installed pi %s\n' "$(pi --version 2>/dev/null)" >&2
+fi
+uid="${SAPI_UID:-0}"
+gid="${SAPI_GID:-0}"
+if [ "$uid" != "0" ]; then
+    for dir in /pi-config /pi-sessions /home/sapi; do
+        [ "$(stat -c '%u:%g' "$dir")" = "$uid:$gid" ] || chown -R "$uid:$gid" "$dir"
+    done
+    exec setpriv --reuid "$uid" --regid "$gid" --clear-groups \
+        env HOME=/home/sapi USER=sapi pi "$@"
+fi
+exec pi "$@"
+ENTRYPOINT_EOF
+RUN chmod 0755 /usr/local/bin/sapi-entrypoint
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/sapi-entrypoint"]
+DOCKERFILE_EOF
+readonly DOCKERFILE
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+die() { printf 'sapi: %s\n' "$*" >&2; exit 1; }
+log() { printf 'sapi: %s\n' "$*" >&2; }
+
+usage() {
+    cat <<EOF
+sapi $SAPI_VERSION — the pi coding agent, isolated in Docker, scoped to this directory.
+
+Usage:
+  sapi [NAME]        Start (or resume) an agent in the current directory
+  sapi ls            List sapi containers
+  sapi rm [--all]    Remove this directory's containers (or all of them)
+  sapi shell [NAME]  Open a bash shell inside the running container
+  sapi build         Build the image without starting a container
+  sapi dockerfile    Print the embedded Dockerfile
+  sapi upgrade       Upgrade sapi itself
+  sapi version       Print version
+  sapi help          Show this help
+
+Environment:
+  SAPI_MODEL          Model for pi --model (default: pi decides)
+  SAPI_PI_VERSION     pi npm version to install in the image (default: latest)
+  SAPI_AUTO_UPDATE=0  Do not run 'pi update' on container start
+  SAPI_REBUILD=1      Rebuild the image from scratch
+  SAPI_UID / SAPI_GID Container user (default: your uid/gid on Linux, root on macOS)
+  SAPI_CONFIG_VOLUME  Docker volume for pi config and credentials (default: sapi-config)
+  SAPI_DOCKER_ARGS    Extra arguments for 'docker create'
+
+Inside the agent:  detach with Ctrl-P, Ctrl-Q.  Reattach with 'sapi'.
+Docs: https://github.com/$SAPI_REPO
+EOF
+}
+
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | awk '{print $1}'
+    else die "need sha256sum or shasum"; fi
+}
+
+sanitize() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[-_.]+//; s/[-_.]+$//'
+}
+
+inspect() { docker container inspect --format "$2" "$1" 2>/dev/null || true; }
+label()   { inspect "$1" "{{index .Config.Labels \"$LABEL.$2\"}}"; }
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker not found. See: https://github.com/$SAPI_REPO#install"
+    if ! docker info >/dev/null 2>&1; then
+        if [[ "$OS" == "Darwin" ]] && command -v open >/dev/null 2>&1; then
+            log "Docker is not running; trying to start OrbStack or Docker Desktop ..."
+            open -gj -a OrbStack >/dev/null 2>&1 || open -gj -a Docker >/dev/null 2>&1 || true
+            for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+        fi
+    fi
+    docker info >/dev/null 2>&1 || die "Docker is not running or you lack permission (on Linux: sudo usermod -aG docker \$USER, then re-login)."
+}
+
+# ---------------------------------------------------------------------------
+# Context
+# ---------------------------------------------------------------------------
+OS="$(uname -s)"
+WORKSPACE="$(pwd -P)"
+WORKSPACE_HASH="$(printf '%s' "$WORKSPACE" | sha256)"
+PI_VERSION="${SAPI_PI_VERSION:-latest}"
+MODEL="${SAPI_MODEL:-}"
+REBUILD="${SAPI_REBUILD:-0}"
+AUTO_UPDATE="${SAPI_AUTO_UPDATE:-1}"
+if [[ "$OS" == "Linux" ]]; then
+    UID_="${SAPI_UID:-$(id -u)}"; GID_="${SAPI_GID:-$(id -g)}"
+else
+    UID_="${SAPI_UID:-0}"; GID_="${SAPI_GID:-0}"
+fi
+readonly OS WORKSPACE WORKSPACE_HASH PI_VERSION MODEL REBUILD AUTO_UPDATE UID_ GID_
+
+[[ "$REBUILD" == 0 || "$REBUILD" == 1 ]] || die "SAPI_REBUILD must be 0 or 1"
+[[ "$AUTO_UPDATE" == 0 || "$AUTO_UPDATE" == 1 ]] || die "SAPI_AUTO_UPDATE must be 0 or 1"
+[[ "$UID_$GID_" =~ ^[0-9]+$ ]] || die "SAPI_UID and SAPI_GID must be integers"
+
+# The image tag is a hash of everything that goes into it.
+IMAGE="${SAPI_IMAGE:-$IMAGE_REPOSITORY:$(printf '%s\n%s\n' "$PI_VERSION" "$DOCKERFILE" | sha256 | cut -c1-12)}"
+readonly IMAGE
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_build() {
+    require_docker
+    if [[ "$REBUILD" == 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        local opts=(--tag "$IMAGE" --build-arg "PI_VERSION=$PI_VERSION")
+        [[ "$REBUILD" == 1 ]] && opts+=(--no-cache --pull)
+        log "building $IMAGE ..."
+        local ctx; ctx="$(mktemp -d)"
+        printf '%s\n' "$DOCKERFILE" | DOCKER_BUILDKIT=1 docker build "${opts[@]}" -f - "$ctx"
+        rmdir "$ctx"
+    fi
+}
+
+cmd_ls() {
+    require_docker
+    docker container ls --all --filter "label=$LABEL.managed=true" \
+        --format 'table {{.Names}}\t{{.Status}}\t{{index .Labels "sh.sapi.workspace"}}'
+}
+
+cmd_rm() {
+    require_docker
+    local filter=("--filter" "label=$LABEL.managed=true")
+    [[ "${1:-}" == "--all" ]] || filter+=("--filter" "label=$LABEL.workspace-hash=$WORKSPACE_HASH")
+    local names
+    names="$(docker container ls --all --quiet "${filter[@]}" --format '{{.Names}}')"
+    [[ -n "$names" ]] || { log "nothing to remove"; return 0; }
+    local n
+    for n in $names; do
+        local vol; vol="$(label "$n" sessions-volume)"
+        docker container rm --force "$n" >/dev/null && log "removed container $n"
+        [[ -n "$vol" ]] && docker volume rm "$vol" >/dev/null 2>&1 && log "removed volume $vol"
+    done
+    log "kept config volume $CONFIG_VOLUME (credentials). Remove with: docker volume rm $CONFIG_VOLUME"
+}
+
+cmd_shell() {
+    require_docker
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        name="$(docker container ls --quiet --filter "label=$LABEL.workspace-hash=$WORKSPACE_HASH" --format '{{.Names}}' | head -n1)"
+        [[ -n "$name" ]] || die "no running container for $WORKSPACE"
+    fi
+    exec docker exec --interactive --tty --user "$UID_:$GID_" --env HOME=/home/sapi "$name" bash
+}
+
+cmd_upgrade() {
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    local url="https://raw.githubusercontent.com/$SAPI_REPO/$SAPI_REF/install.sh"
+    log "fetching $url"
+    curl -fsSL "$url" | SAPI_INSTALL_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" bash
+}
+
+attach() {
+    local name="$1"
+    printf '\n  container  %s\n  workspace  %s\n  config     %s\n  sessions   %s\n  user       %s\n  detach     Ctrl-P, Ctrl-Q\n\n' \
+        "$name" "$WORKSPACE" "$CONFIG_VOLUME" "$(label "$name" sessions-volume)" "$UID_:$GID_" >&2
+    exec docker start --attach --interactive "$name"
+}
+
+cmd_start() {
+    [[ -t 0 && -t 1 ]] || die "an interactive terminal is required"
+    cmd_build
+    local image_id; image_id="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
+
+    local base
+    if [[ -n "${1:-}" ]]; then base="$(sanitize "$1")"
+    else
+        local ws; ws="$(sanitize "$(basename "$WORKSPACE")")"; ws="${ws:-workspace}"
+        base="sapi-${ws:0:36}-${WORKSPACE_HASH:0:8}"
+    fi
+    [[ -n "$base" ]] || die "invalid container name"
+    base="${base:0:54}"
+
+    docker volume create "$CONFIG_VOLUME" >/dev/null
+
+    # Find a free slot: resume a compatible stopped container, replace an
+    # incompatible one, or allocate a new slot if one is already running.
+    local slot=1 name sessions
+    while :; do
+        name="$base"; [[ "$slot" -gt 1 ]] && name="$base-$slot"
+        sessions="$name-sessions"
+        docker container inspect "$name" >/dev/null 2>&1 || break
+        if [[ "$(label "$name" managed)" != "true" || "$(label "$name" workspace-hash)" != "$WORKSPACE_HASH" ]]; then
+            slot=$((slot + 1)); continue
+        fi
+        case "$(inspect "$name" '{{.State.Status}}')" in
+            created | exited | dead)
+                if [[ "$(inspect "$name" '{{.Image}}')" == "$image_id" \
+                    && "$(label "$name" version)" == "$SAPI_VERSION" \
+                    && "$(label "$name" model)" == "$MODEL" \
+                    && "$(label "$name" user)" == "$UID_:$GID_" \
+                    && "$(label "$name" auto-update)" == "$AUTO_UPDATE" ]]; then
+                    log "resuming $name"
+                    attach "$name"
+                fi
+                log "refreshing $name (image or settings changed; sessions are kept)"
+                docker container rm --force "$name" >/dev/null
+                break ;;
+            *) slot=$((slot + 1)); continue ;;
+        esac
+    done
+
+    docker volume create "$sessions" >/dev/null
+
+    local pi_args=(--continue)
+    [[ -n "$MODEL" ]] && pi_args+=(--model "$MODEL")
+    local extra=()
+    # shellcheck disable=SC2206
+    [[ -n "${SAPI_DOCKER_ARGS:-}" ]] && extra=($SAPI_DOCKER_ARGS)
+
+    docker create \
+        --interactive --tty --init \
+        --name "$name" \
+        --hostname sapi \
+        --label "$LABEL.managed=true" \
+        --label "$LABEL.version=$SAPI_VERSION" \
+        --label "$LABEL.workspace=$WORKSPACE" \
+        --label "$LABEL.workspace-hash=$WORKSPACE_HASH" \
+        --label "$LABEL.model=$MODEL" \
+        --label "$LABEL.user=$UID_:$GID_" \
+        --label "$LABEL.auto-update=$AUTO_UPDATE" \
+        --label "$LABEL.sessions-volume=$sessions" \
+        --volume "$WORKSPACE:/workspace" \
+        --mount "type=volume,source=$CONFIG_VOLUME,target=/pi-config" \
+        --mount "type=volume,source=$sessions,target=/pi-sessions" \
+        --workdir /workspace \
+        --env PI_CODING_AGENT_DIR=/pi-config \
+        --env PI_CODING_AGENT_SESSION_DIR=/pi-sessions \
+        --env "SAPI_AUTO_UPDATE=$AUTO_UPDATE" \
+        --env "SAPI_UID=$UID_" \
+        --env "SAPI_GID=$GID_" \
+        --security-opt no-new-privileges \
+        --cap-drop ALL \
+        --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER \
+        --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
+        ${extra[@]+"${extra[@]}"} \
+        "$IMAGE" "${pi_args[@]}" >/dev/null \
+        || die "could not create container $name"
+
+    attach "$name"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+    ""|-*)
+        case "${1:-}" in
+            "") cmd_start ;;
+            -h|--help) usage ;;
+            -V|--version) printf '%s\n' "$SAPI_VERSION" ;;
+            *) die "unknown option: $1 (see sapi help)" ;;
+        esac ;;
+    help)       usage ;;
+    version)    printf '%s\n' "$SAPI_VERSION" ;;
+    dockerfile) printf '%s\n' "$DOCKERFILE" ;;
+    build)      cmd_build ;;
+    ls)         cmd_ls ;;
+    rm)         cmd_rm "${2:-}" ;;
+    shell)      cmd_shell "${2:-}" ;;
+    upgrade)    cmd_upgrade ;;
+    *)          [[ $# -eq 1 ]] || die "expected at most one container name (see sapi help)"
+                cmd_start "$1" ;;
+esac
