@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml/badge.svg)](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml)
 
-**The [pi](https://github.com/badlogic/pi-mono) coding agent, isolated in Docker, scoped to the directory you run it from.**
+**[The Super Accessible Pi agent](https://github.com/badlogic/pi-mono), isolated, and scoped to the directory you invoke it from.**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sapiensmalti/sapi/main/install.sh | bash
