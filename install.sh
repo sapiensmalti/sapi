@@ -22,7 +22,7 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-curl -fsSL "$URL" -o "$tmp" || die "download failed: $URL"
+curl -fsSL --proto "=https,file" --tlsv1.2 "$URL" -o "$tmp" || die "download failed: $URL"
 head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash$' || die "downloaded file does not look like sapi"
 bash -n "$tmp" || die "downloaded file failed a syntax check"
 

@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml/badge.svg)](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml)
 
-**[The Super Accessible Pi agent](https://github.com/badlogic/pi-mono), isolated, and scoped to the directory you invoke it from.**
+**The Super Accessible [pi](https://github.com/badlogic/pi-mono) agent, isolated, and scoped to the directory you invoke it from.**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sapiensmalti/sapi/main/install.sh | bash
@@ -78,6 +78,7 @@ All optional, all environment variables:
 | `SAPI_REBUILD` | `0` | `1` rebuilds the image from scratch (`--no-cache --pull`) |
 | `SAPI_UID` / `SAPI_GID` | your uid/gid on Linux; `0` on macOS | user the agent runs as inside the container |
 | `SAPI_CONFIG_VOLUME` | `sapi-config` | Docker volume holding pi's config and credentials |
+| `SAPI_ENV` | | space-separated host variables to pass in, e.g. `"ANTHROPIC_API_KEY GH_TOKEN"` |
 | `SAPI_DOCKER_ARGS` | | extra flags for `docker create` (e.g. `-p 3000:3000`) |
 
 ## How it works

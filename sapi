@@ -98,7 +98,8 @@ Environment:
   SAPI_REBUILD=1      Rebuild the image from scratch
   SAPI_UID / SAPI_GID Container user (default: your uid/gid on Linux, root on macOS)
   SAPI_CONFIG_VOLUME  Docker volume for pi config and credentials (default: sapi-config)
-  SAPI_DOCKER_ARGS    Extra arguments for 'docker create'
+  SAPI_ENV            Space-separated host variables to pass through, e.g. "ANTHROPIC_API_KEY GH_TOKEN"
+  SAPI_DOCKER_ARGS    Extra arguments for 'docker create' (split on whitespace)
 
 Inside the agent:  detach with Ctrl-P, Ctrl-Q.  Reattach with 'sapi'.
 Docs: https://github.com/$SAPI_REPO
@@ -182,7 +183,7 @@ cmd_rm() {
     local filter=("--filter" "label=$LABEL.managed=true")
     [[ "${1:-}" == "--all" ]] || filter+=("--filter" "label=$LABEL.workspace-hash=$WORKSPACE_HASH")
     local names
-    names="$(docker container ls --all --quiet "${filter[@]}" --format '{{.Names}}')"
+    names="$(docker container ls --all "${filter[@]}" --format '{{.Names}}')"
     [[ -n "$names" ]] || { log "nothing to remove"; return 0; }
     local n
     for n in $names; do
@@ -197,7 +198,7 @@ cmd_shell() {
     require_docker
     local name="${1:-}"
     if [[ -z "$name" ]]; then
-        name="$(docker container ls --quiet --filter "label=$LABEL.workspace-hash=$WORKSPACE_HASH" --format '{{.Names}}' | head -n1)"
+        name="$(docker container ls --filter "label=$LABEL.workspace-hash=$WORKSPACE_HASH" --format '{{.Names}}' | head -n1)"
         [[ -n "$name" ]] || die "no running container for $WORKSPACE"
     fi
     exec docker exec --interactive --tty --user "$UID_:$GID_" --env HOME=/home/sapi "$name" bash
@@ -264,9 +265,14 @@ cmd_start() {
 
     local pi_args=(--continue)
     [[ -n "$MODEL" ]] && pi_args+=(--model "$MODEL")
-    local extra=()
+    local extra=() var
+    for var in ${SAPI_ENV:-}; do
+        [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "SAPI_ENV: invalid variable name '$var'"
+        [[ -n "${!var:-}" ]] || log "warning: SAPI_ENV variable $var is unset"
+        extra+=(--env "$var")
+    done
     # shellcheck disable=SC2206
-    [[ -n "${SAPI_DOCKER_ARGS:-}" ]] && extra=($SAPI_DOCKER_ARGS)
+    [[ -n "${SAPI_DOCKER_ARGS:-}" ]] && extra+=($SAPI_DOCKER_ARGS)
 
     docker create \
         --interactive --tty --init \
@@ -286,6 +292,7 @@ cmd_start() {
         --workdir /workspace \
         --env PI_CODING_AGENT_DIR=/pi-config \
         --env PI_CODING_AGENT_SESSION_DIR=/pi-sessions \
+        --env GIT_CONFIG_GLOBAL=/pi-config/gitconfig \
         --env "SAPI_AUTO_UPDATE=$AUTO_UPDATE" \
         --env "SAPI_UID=$UID_" \
         --env "SAPI_GID=$GID_" \

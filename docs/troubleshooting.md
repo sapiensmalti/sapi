@@ -44,5 +44,15 @@ Or keep using the old volume: `export SAPI_CONFIG_VOLUME=pi-coding-agent-config`
 **Rebuild everything**
 `SAPI_REBUILD=1 sapi` pulls fresh base images and rebuilds without cache.
 
+**`git commit` inside the agent fails with "Please tell me who you are"**
+Set your identity once; it is stored in the config volume and survives container rebuilds:
+`git config --global user.name "You" && git config --global user.email you@example.com`
+(run it from `sapi shell`, or ask the agent to).
+
+**`git push` / API calls need a token**
+Nothing from your host environment is passed in by default. Opt in per variable:
+`SAPI_ENV="GH_TOKEN ANTHROPIC_API_KEY" sapi`. Only pass what the task needs.
+
 **Still stuck**
 Run `sapi dockerfile` and `docker info`, and open an issue with the output and your OS.
+
