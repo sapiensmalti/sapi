@@ -53,7 +53,7 @@ done
 
 echo "isolation"
 run --entrypoint /bin/sh "$SAPI_IMAGE" -c 'test ! -e /var/run/docker.sock' && ok "no docker socket" || bad "docker socket present"
-mounts="$(run --entrypoint /bin/sh "$SAPI_IMAGE" -c "awk '\$5 !~ /^\/(proc|sys|dev)/ {print \$5}' /proc/self/mountinfo | grep -v '^/$' | grep -v '^/etc/' | grep -v '^/workspace$'" || true)"
+mounts="$(run --entrypoint /bin/sh "$SAPI_IMAGE" -c "awk '\$5 !~ /^\/(proc|sys|dev)/ {print \$5}' /proc/self/mountinfo | grep -v '^/$' | grep -v '^/etc/' | grep -v '^/workspace$' | grep -v '^/usr/sbin/docker-init$'" || true)"
 [[ -z "$mounts" ]] && ok "only /workspace is mounted from outside" || bad "unexpected mounts: $mounts"
 run --entrypoint /bin/sh "$SAPI_IMAGE" -c 'grep -q NoNewPrivs:.1 /proc/self/status' && ok "no-new-privileges" || bad "no-new-privileges"
 

@@ -174,7 +174,7 @@ cmd_build() {
 cmd_ls() {
     require_docker
     docker container ls --all --filter "label=$LABEL.managed=true" \
-        --format 'table {{.Names}}\t{{.Status}}\t{{index .Labels "sh.sapi.workspace"}}'
+        --format 'table {{.Names}}\t{{.Status}}\t{{.Label "sh.sapi.workspace"}}'
 }
 
 cmd_rm() {
