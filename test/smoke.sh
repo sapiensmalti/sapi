@@ -37,7 +37,7 @@ owner="$(docker run --rm --init "${harden[@]}" -e SAPI_AUTO_UPDATE=0 -e SAPI_UID
     -v "$ws:/workspace" --entrypoint /bin/bash "$SAPI_IMAGE" -c '
         mkdir -p /tmp/fake && printf "#!/bin/sh\ntouch /workspace/probe; id -u; id -g; echo \$HOME; grep -E \"^Cap(Eff|Prm)\" /proc/self/status | tr \"\\t\" \" \" | cut -d\" \" -f2\n" > /tmp/fake/pi && chmod +x /tmp/fake/pi
         PATH=/tmp/fake:$PATH exec /usr/local/bin/sapi-entrypoint' 2>&1 | tr '\n' ' ')"
-[[ "$owner" == "$uid $gid /home/sapi 0 0 " ]] && ok "drops to $uid:$gid with HOME=/home/sapi and no capabilities" || bad "privilege drop: got '$owner'"
+[[ "$owner" == "$uid $gid /home/sapi 0000000000000000 0000000000000000 " ]] && ok "drops to $uid:$gid with HOME=/home/sapi and no capabilities" || bad "privilege drop: got '$owner'"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
     got="$(stat -c '%u:%g' "$ws/probe")"
@@ -83,7 +83,7 @@ docker exec smoke-egress test -f /run/egress/ready && ok "sidecar ready (firewal
 docker exec smoke-egress ps -o user,comm 2>/dev/null | grep -q 'egress .*sapi-egress' && ok "proxy runs as the unprivileged uid" || bad "proxy uid: $(docker exec smoke-egress ps -o user,comm)"
 help="$(docker run --rm --entrypoint /usr/local/bin/sapi-egress sapi-egress:smoke --help)"
 ! grep -qE 'no-firewall|test-upstream|allow-private' <<<"$help" && ok "production sidecar contains no test bypass flags" || bad "production bypass flags exposed"
-docker exec smoke-egress test -w / && bad "sidecar root filesystem is writable" || ok "sidecar root filesystem is read-only"
+docker exec smoke-egress touch /sapi-write-test >/dev/null 2>&1 && bad "sidecar root filesystem is writable" || ok "sidecar root filesystem is read-only"
 docker restart smoke-egress >/dev/null
 for _ in $(seq 1 50); do docker exec smoke-egress test -f /run/egress/ready 2>/dev/null && break; sleep 0.2; done
 docker exec smoke-egress test -f /run/egress/ready && ok "sidecar becomes ready after a restart" || bad "sidecar restart readiness"
@@ -153,7 +153,7 @@ set -e
 m="$(ls "$HOME"/.local/share/sapi/backups/*/*.run 2>/dev/null | tail -1)"
 [[ -n "$m" ]] && grep -q "^exit_code = [1-9]" "$m" && ok "--safer run wrote a manifest with the real exit code" || bad "run manifest: ${m:-none}"
 (cd "$proj" && echo changed >a.txt && ! "$sapi_bin" diff >/dev/null 2>&1) && ok "diff sees the change after a real run" || bad "diff"
-(cd "$proj" && "$sapi_bin" rm >/dev/null 2>&1)
+if (cd "$proj" && "$sapi_bin" rm); then ok "sapi rm completes with session volumes present"; else bad "sapi rm failed"; fi
 [[ -z "$(docker volume ls -q --filter "label=sh.sapi.workspace=$proj" --filter "label=sh.sapi.volume-role=sessions")" ]] \
     && ok "sapi rm removes headless and interactive session volumes" || bad "session volumes left behind"
 rm -rf "$proj" "$HOME/.local/share/sapi"

@@ -23,8 +23,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install shellcheck
       - run: test/check.sh
-        env:
-          DEBUG: ${{ runner.os == 'macOS' && 1 || 0 }}
 
   egress:
     name: egress (fmt, clippy, tests, image)
@@ -61,10 +59,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: start an isolated Linux Docker VM
         run: |
-          brew install colima docker docker-buildx
+          brew install colima docker docker-buildx qemu
           mkdir -p "$HOME/.docker/cli-plugins"
           ln -sf "$(brew --prefix)/opt/docker-buildx/bin/docker-buildx" "$HOME/.docker/cli-plugins/docker-buildx"
-          colima start --vm-type=vz --cpu 2 --memory 4 --disk 20
+          if ! colima start --vm-type=vz --cpu 2 --memory 4 --disk 20; then
+            find "$HOME/.colima" -type f -name '*.log' -maxdepth 6 -print -exec tail -n 80 {} \;
+            exit 1
+          fi
       - name: real Docker smoke on macOS
         env:
           TMPDIR: ${{ runner.temp }}
