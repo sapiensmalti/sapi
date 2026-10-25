@@ -79,21 +79,21 @@ docker run -d --name smoke-egress --init --security-opt no-new-privileges --cap-
 for _ in $(seq 1 50); do docker exec smoke-egress test -f /run/egress/ready 2>/dev/null && break; sleep 0.2; done
 docker exec smoke-egress test -f /run/egress/ready && ok "sidecar ready (firewall applied, privileges dropped)" || { bad "sidecar not ready"; docker logs smoke-egress; }
 docker exec smoke-egress ps -o user,comm 2>/dev/null | grep -q 'egress .*sapi-egress' && ok "proxy runs as the unprivileged uid" || bad "proxy uid: $(docker exec smoke-egress ps -o user,comm)"
-agent() { docker run --rm --network container:smoke-egress --cap-drop ALL --security-opt no-new-privileges "$SAPI_IMAGE" "$@"; }
+agent() { local ep="$1"; shift; docker run --rm --network container:smoke-egress --cap-drop ALL --security-opt no-new-privileges --entrypoint "$ep" "$SAPI_IMAGE" "$@"; }
 # Allowed: HTTPS by SNI, relayed by name.
-agent --entrypoint curl -- -fsS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/ 2>/dev/null | grep -q '^[23]' && ok "allowed https host reachable" || bad "allowed https host unreachable"
+agent curl -fsS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/ 2>/dev/null | grep -q '^[23]' && ok "allowed https host reachable" || bad "allowed https host unreachable"
 # Allowed: plain HTTP by Host header.
-agent --entrypoint curl -- -fsS -m 20 -o /dev/null -w '%{http_code}' http://deb.debian.org/debian/ 2>/dev/null | grep -q '^[23]' && ok "allowed http host reachable" || bad "allowed http host unreachable"
+agent curl -fsS -m 20 -o /dev/null -w '%{http_code}' http://deb.debian.org/debian/ 2>/dev/null | grep -q '^[23]' && ok "allowed http host reachable" || bad "allowed http host unreachable"
 # Denied: name not in list → NXDOMAIN at the fake resolver.
-agent --entrypoint curl -- -sS -m 10 https://example.com/ >/dev/null 2>&1 && bad "denied host was reachable!" || ok "denied host unreachable"
+agent curl -sS -m 10 https://example.com/ >/dev/null 2>&1 && bad "denied host was reachable!" || ok "denied host unreachable"
 # Denied: allowed name, different port → dropped by policy.
-agent --entrypoint bash -- -c 'timeout 5 bash -c "exec 3<>/dev/tcp/api.github.com/22"' >/dev/null 2>&1 && bad "non-80/443 port was open!" || ok "other ports dropped"
+agent bash -c 'timeout 5 bash -c "exec 3<>/dev/tcp/api.github.com/22"' >/dev/null 2>&1 && bad "non-80/443 port was open!" || ok "other ports dropped"
 # Denied: raw IP with no name → connects to the filter, which has no SNI match... curl sends SNI only for names, so this is 'no hostname' → denied.
-agent --entrypoint curl -- -sS -m 10 -k https://1.1.1.1/ >/dev/null 2>&1 && bad "raw IP egress possible!" || ok "raw IP egress blocked"
+agent curl -sS -m 10 -k https://1.1.1.1/ >/dev/null 2>&1 && bad "raw IP egress possible!" || ok "raw IP egress blocked"
 # The agent cannot change the rules (no NET_ADMIN).
 docker run --rm --network container:smoke-egress --cap-drop ALL --security-opt no-new-privileges --entrypoint iptables sapi-egress:smoke -P OUTPUT ACCEPT >/dev/null 2>&1 && bad "a container without NET_ADMIN could alter the firewall!" || ok "the firewall cannot be altered without NET_ADMIN"
 # Decisions are logged as JSON.
-docker logs smoke-egress 2>/dev/null | grep -q '"ev":"deny"' && docker logs smoke-egress 2>/dev/null | grep -q '"ev":"allow"' && ok "allow and deny decisions logged" || bad "egress log"
+docker logs smoke-egress 2>/dev/null | grep -q '"ev":"deny"' && docker logs smoke-egress 2>/dev/null | grep -q '"ev":"allow","proto":"tls","host":"api.github.com"' && ok "allow and deny decisions logged" || { bad "egress log"; docker logs smoke-egress 2>&1 | tail -n 20; }
 # Through the launcher: allowlist mode brings the sidecar up, runs, tears it down.
 proj="$(mktemp -d)"
 set +e
