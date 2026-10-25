@@ -67,7 +67,6 @@ sapi config          show or set persistent settings
 sapi shell           a shell in /pi-sessions (session files) with /pi-config beside it; --net for network
 sapi ls              list sapi containers
 sapi rm [--all]      remove this directory's containers (or all)
-sapi shell [NAME]    bash inside the running container
 sapi build           build the image without starting
 sapi dockerfile      print the embedded Dockerfile
 sapi upgrade         upgrade sapi itself
