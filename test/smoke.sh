@@ -62,5 +62,21 @@ echo "cli (docker-backed)"
 sapi_bin="$PWD/sapi"
 (cd "$ws" && "$sapi_bin" rm >/dev/null 2>&1) && ok "sapi rm (nothing to remove)" || bad "sapi rm"
 
+echo "sapi run (real container)"
+proj="$(mktemp -d)"; echo hello >"$proj/a.txt"
+set +e
+out="$(cd "$proj" && SAPI_MODEL=bogus/none SAPI_AUTO_UPDATE=0 SAPI_IMAGE="$SAPI_IMAGE" "$sapi_bin" run "say hi" 2>/tmp/run.err)"; code=$?
+set -e
+[[ $code -ne 0 ]] && ok "run exits non-zero when pi fails (exit $code)" || bad "run should fail with a bogus model: $out"
+grep -qi model <<<"$out$(cat /tmp/run.err)" && ok "pi error surfaced" || bad "no pi error: $out $(cat /tmp/run.err)"
+[[ -z "$(docker ps -aq --filter label=sh.sapi.run=true)" ]] && ok "run container removed (--rm)" || bad "run container left behind"
+set +e
+(cd "$proj" && SAPI_MODEL=bogus/none SAPI_AUTO_UPDATE=0 SAPI_IMAGE="$SAPI_IMAGE" "$sapi_bin" --safer run "x" >/dev/null 2>&1)
+set -e
+m="$(ls "$HOME"/.local/share/sapi/backups/*/*.run 2>/dev/null | tail -1)"
+[[ -n "$m" ]] && grep -q "^exit_code = [1-9]" "$m" && ok "--safer run wrote a manifest with the real exit code" || bad "run manifest: ${m:-none}"
+(cd "$proj" && echo changed >a.txt && ! "$sapi_bin" diff >/dev/null 2>&1) && ok "diff sees the change after a real run" || bad "diff"
+rm -rf "$proj" "$HOME/.local/share/sapi"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
