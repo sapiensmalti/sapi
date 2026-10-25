@@ -100,6 +100,42 @@ check "project-level Dockerfile.extra is ignored" bash -c "printf 'RUN evil\\n' 
 check "dockerfile_extra path is configurable" bash -c "printf 'RUN elsewhere\\n' > $HOME/other.df && cd $proj && SAPI_DOCKERFILE_EXTRA=$HOME/other.df $S dockerfile | grep -q elsewhere"
 "$S" config set packages "" >/dev/null 2>&1 || sed -i.bak '/^packages/d' "$($S config path)"; rm -f "$HOME/.config/sapi/Dockerfile.extra"
 
+echo "network (settings + launcher ordering via shim)"
+check "network defaults to full"             bash -c "cd $proj && $S config show | grep -q 'network *full *(default)'"
+check "allow defaults to @providers"         bash -c "cd $proj && $S config show | grep -q 'allow *@providers *(default)'"
+check "network rejects other values"         bash -c "! $S config set network sometimes"
+check "allow accepts presets, hosts, wildcards, ports" bash -c "cd $proj && $S config set allow '@github, *.example.org api.example.com:8443' >/dev/null"
+check "allow rejects unknown preset"         bash -c "! $S config set allow @nope"
+check "allow rejects metacharacters"         bash -c "! $S config set allow 'a;b' && ! $S config set allow '*.' && ! $S config set allow 'a..b' && ! $S config set allow '\$(id).com'"
+nshim="$(mktemp -d)"
+cat >"$nshim/docker" <<NS
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> $nshim/calls
+case "\$1" in
+  info|image|exec|stop) exit 0 ;;
+  volume) echo v ;;
+  container) case "\$2" in inspect) [[ "\$*" == *".State.Running"* ]] && echo true || exit 1 ;; *) exit 0 ;; esac ;;
+  run) [[ "\$*" == *--detach* ]] && { echo id; exit 0; }; echo "Answer"; exit 0 ;;
+  *) exit 0 ;;
+esac
+NS
+chmod +x "$nshim/docker"
+run_net() { : >"$nshim/calls"; (cd "$proj" && env "$@" PATH="$nshim:$PATH" "$S" run x >/dev/null 2>"$nshim/err"); }
+run_net SAPI_NETWORK=allowlist SAPI_ALLOW="@providers @github"
+check "sidecar starts before the agent, ready is probed between" bash -c "grep -nE '^(run --detach|exec .*test -f /run/egress/ready|run --rm)' $nshim/calls | cut -d: -f2 | cut -c1-12 | tr '\n' ' ' | grep -q '^run --detach exec .*run --rm'"
+check "sidecar gets NET_ADMIN SETUID SETGID only, hardened" bash -c "l=\$(grep '^run --detach' $nshim/calls); [[ \$l == *'--cap-drop ALL'* && \$l == *'--cap-add NET_ADMIN'* && \$l == *'--security-opt no-new-privileges'* && \$l == *'--pids-limit'* ]] && ! [[ \$l == *'--privileged'* ]]"
+check "presets are expanded for the sidecar"  bash -c "grep '^run --detach' $nshim/calls | grep -q 'EGRESS_ALLOW=api.anthropic.com .*github.com'"
+check "agent shares the sidecar namespace, no hostname" bash -c "l=\$(grep '^run --rm' $nshim/calls); [[ \$l == *'--network container:'*'-egress'* ]] && ! [[ \$l == *'--hostname'* ]]"
+check "agent never gets the docker socket or NET_ADMIN" bash -c "! grep '^run --rm' $nshim/calls | grep -qE 'docker.sock|NET_ADMIN'"
+check "sidecar is stopped after the run"      bash -c "tail -n1 $nshim/calls | grep -q '^stop .*-egress'"
+check "self-update skipped without @npm"      bash -c "grep '^run --rm' $nshim/calls | grep -q 'SAPI_AUTO_UPDATE=0' && grep -q 'skipping pi self-update' $nshim/err"
+run_net SAPI_NETWORK=allowlist SAPI_ALLOW="@providers @npm"
+check "self-update kept with @npm"            bash -c "grep '^run --rm' $nshim/calls | grep -q 'SAPI_AUTO_UPDATE=1'"
+run_net SAPI_NETWORK=full
+check "full mode: no sidecar, hostname set"   bash -c "! grep -q -- --detach $nshim/calls && grep '^run --rm' $nshim/calls | grep -q -- '--hostname sapi'"
+check "egress image is pinned by digest"      bash -c "grep -q 'sapi-egress@sha256:[0-9a-f]\{64\}' $S && grep -q 'EGRESS_SOURCE_SHA256=\"[0-9a-f]\{64\}\"' $S"
+rm -rf "$nshim"
+
 echo "diff / selective restore"
 rm -rf "$HOME/.local/share/sapi"; echo hello >"$proj/a.txt"; echo keep >"$proj/c.txt"
 (cd "$proj" && "$S" backup >/dev/null 2>&1)

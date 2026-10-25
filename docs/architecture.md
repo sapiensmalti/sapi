@@ -58,6 +58,10 @@ Settings are table-driven (`setting_spec`): one line per key gives type, environ
 
 `container_args` is the single source of the container specification — mounts, environment, hardening, resource ceilings — used by both the interactive start and `sapi run`. When safer mode is on, `backup_create` runs after the image build and before any container exists; `sapi run` additionally writes a run manifest beside the backup. `sapi diff` extracts the backup to a private temp dir and uses portable `diff -rq`. Guarantees and the unattended workflow are in [recovery.md](recovery.md).
 
+## Network egress allowlist
+
+Opt-in. `prepare_network` computes a signature of the expanded allowlist (part of the container's compatibility labels) and whether pi's self-update can run. `egress_start` pulls the digest-pinned sidecar image (or builds it from the pinned source tarball with `SAPI_EGRESS_BUILD=1`), starts it with `NET_ADMIN SETUID SETGID SETPCAP` only, and `egress_wait` blocks on its ready marker before the agent container is created with `--network container:<sidecar>`. The sidecar itself is [`egress/`](../egress): fake DNS, TLS-SNI and HTTP-Host filters, connect-by-name relay, iptables rule table — all pure functions with tests, plus one privileged setup step. Design and guarantees: [network.md](network.md).
+
 ## Why bash, not Rust
 
 Docker is doing the heavy lifting: isolation, image caching, lifecycle. The launcher is glue. Glue in bash is auditable in one sitting by anyone, has zero build step, zero dependencies, and ships as a text file. A Rust binary would need per-platform builds, signing on macOS, and a release pipeline — cost with no benefit at this size. If sapi ever grows a long-running component (a daemon, a swarm coordinator, an API), that is where Rust belongs.

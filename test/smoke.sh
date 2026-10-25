@@ -68,6 +68,42 @@ pkg_img="sapi:smoke-pkg"
 docker run --rm --entrypoint /usr/bin/file "$pkg_img" --version >/dev/null 2>&1 && ok "package is present in the image" || bad "package missing"
 docker image rm -f "$pkg_img" >/dev/null 2>&1 || true
 
+echo "egress allowlist (real firewall)"
+# Build the sidecar from this checkout and prove the namespace firewall with a
+# plain container that shares its network namespace. CI has internet.
+if docker build -q -f egress/Dockerfile -t sapi-egress:smoke egress >/dev/null 2>&1; then ok "sidecar image builds"; else bad "sidecar image build"; fi
+docker rm -f smoke-egress >/dev/null 2>&1 || true
+docker run -d --name smoke-egress --init --security-opt no-new-privileges --cap-drop ALL \
+    --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
+    -e EGRESS_ALLOW="api.github.com deb.debian.org" sapi-egress:smoke >/dev/null
+for _ in $(seq 1 50); do docker exec smoke-egress test -f /run/egress/ready 2>/dev/null && break; sleep 0.2; done
+docker exec smoke-egress test -f /run/egress/ready && ok "sidecar ready (firewall applied, privileges dropped)" || { bad "sidecar not ready"; docker logs smoke-egress; }
+docker exec smoke-egress ps -o user,comm 2>/dev/null | grep -q 'egress .*sapi-egress' && ok "proxy runs as the unprivileged uid" || bad "proxy uid: $(docker exec smoke-egress ps -o user,comm)"
+agent() { docker run --rm --network container:smoke-egress --cap-drop ALL --security-opt no-new-privileges "$SAPI_IMAGE" "$@"; }
+# Allowed: HTTPS by SNI, relayed by name.
+agent --entrypoint curl -- -fsS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/ 2>/dev/null | grep -q '^[23]' && ok "allowed https host reachable" || bad "allowed https host unreachable"
+# Allowed: plain HTTP by Host header.
+agent --entrypoint curl -- -fsS -m 20 -o /dev/null -w '%{http_code}' http://deb.debian.org/debian/ 2>/dev/null | grep -q '^[23]' && ok "allowed http host reachable" || bad "allowed http host unreachable"
+# Denied: name not in list → NXDOMAIN at the fake resolver.
+agent --entrypoint curl -- -sS -m 10 https://example.com/ >/dev/null 2>&1 && bad "denied host was reachable!" || ok "denied host unreachable"
+# Denied: allowed name, different port → dropped by policy.
+agent --entrypoint bash -- -c 'timeout 5 bash -c "exec 3<>/dev/tcp/api.github.com/22"' >/dev/null 2>&1 && bad "non-80/443 port was open!" || ok "other ports dropped"
+# Denied: raw IP with no name → connects to the filter, which has no SNI match... curl sends SNI only for names, so this is 'no hostname' → denied.
+agent --entrypoint curl -- -sS -m 10 -k https://1.1.1.1/ >/dev/null 2>&1 && bad "raw IP egress possible!" || ok "raw IP egress blocked"
+# The agent cannot change the rules (no NET_ADMIN).
+docker run --rm --network container:smoke-egress --cap-drop ALL --security-opt no-new-privileges --entrypoint iptables sapi-egress:smoke -P OUTPUT ACCEPT >/dev/null 2>&1 && bad "a container without NET_ADMIN could alter the firewall!" || ok "the firewall cannot be altered without NET_ADMIN"
+# Decisions are logged as JSON.
+docker logs smoke-egress 2>/dev/null | grep -q '"ev":"deny"' && docker logs smoke-egress 2>/dev/null | grep -q '"ev":"allow"' && ok "allow and deny decisions logged" || bad "egress log"
+# Through the launcher: allowlist mode brings the sidecar up, runs, tears it down.
+proj="$(mktemp -d)"
+set +e
+(cd "$proj" && SAPI_NETWORK=allowlist SAPI_ALLOW=@providers SAPI_MODEL=bogus/none SAPI_AUTO_UPDATE=0 SAPI_EGRESS_IMAGE=sapi-egress:smoke SAPI_IMAGE="$SAPI_IMAGE" "$sapi_bin" run "x" >/dev/null 2>/tmp/net.err)
+set -e
+grep -q "run: exit" /tmp/net.err && ok "sapi run in allowlist mode completes" || { bad "allowlist run"; cat /tmp/net.err; }
+[[ -z "$(docker ps -aq --filter label=sh.sapi.egress-of)" ]] && ok "run sidecar removed afterwards" || bad "sidecar left behind"
+rm -rf "$proj"
+docker rm -f smoke-egress >/dev/null 2>&1; docker image rm -f sapi-egress:smoke >/dev/null 2>&1 || true
+
 echo "sapi run (real container)"
 proj="$(mktemp -d)"; echo hello >"$proj/a.txt"
 set +e

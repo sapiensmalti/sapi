@@ -23,6 +23,8 @@ If you want the agent to see a repo, `cd` into that repo. If you want it to see 
 - `--cap-drop ALL` plus only `CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER SETUID SETGID SETPCAP` — exactly what the entrypoint needs to fix volume ownership and drop to your uid. After `setpriv`, the process holds no capabilities.
 - `--security-opt no-new-privileges` — no setuid escalation inside the container.
 - `--init` — a proper PID 1 so signals and zombies behave.
+- Optional `--cpus`, `--memory`, `--pids-limit` ceilings (`cpus`, `memory_mib`, `pids`).
+- Optional egress allowlist: a sidecar owns the network namespace; the agent joins it with no network capabilities. See [network.md](network.md).
 - No `--privileged`, no `--network host`, no `--pid host`, no socket mounts.
 
 On Linux the agent process runs as **your** uid/gid. On macOS it runs as uid 0 *inside the container*, which Docker Desktop/OrbStack map to your user on the bind mount; it is still root only in the container's namespace.
@@ -41,7 +43,7 @@ sapi does **not** protect against:
 
 - **Docker/kernel escapes.** Containers are a strong boundary but not a VM. If this matters to you, run sapi inside a VM.
 - **Harm to the mounted directory itself.** The agent can delete or rewrite everything in it. Use git, commit first, and turn on [safer mode](recovery.md) — a complete backup before every start, stored outside the directory.
-- **Exfiltration over the network.** The agent has internet. Secrets inside the mounted directory (`.env` files, keys) are readable by it and by whatever model provider you use. Keep secrets out of directories you hand to an agent.
+- **Exfiltration over the network — unless you turn on the [egress allowlist](network.md).** By default the agent has internet. Secrets inside the mounted directory (`.env` files, keys) are readable by it and by whatever model provider you use. With `network = allowlist` only the hosts you name are reachable, by name, on 80/443, with DNS answered locally; still keep secrets out of directories you hand to an agent.
 - **A compromised upstream.** sapi installs `pi` from npm and base images from Docker Hub/GHCR at build time, and `pi` self-updates on start. Set `SAPI_AUTO_UPDATE=0` and pin `SAPI_PI_VERSION` if you need reproducibility over freshness.
 
 ## Supply chain of sapi itself

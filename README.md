@@ -28,8 +28,9 @@ AI coding agents run shell commands. Giving one your whole laptop is a bad trade
 - **Recoverable by construction.** `sapi --safer` takes a complete, checksummed backup before every start — stored where the agent cannot reach it — and refuses to start if it cannot. `sapi diff` shows every path the agent changed; `sapi restore latest --files …` puts any of them back. The sandbox protects everything outside the directory; this protects the directory itself.
 - **A Unix command.** `sapi run TASK` runs one headless task: final message on stdout, the agent's exit code, `--timeout`. In a cron job with safer mode, every run leaves a backup, a run manifest and a diff behind — auditable and reversible without the agent's cooperation.
 - **Your toolchain, your call.** `sapi config set packages "golang make"` or a `~/.config/sapi/Dockerfile.extra` extends the image; `sapi dockerfile` shows exactly what gets built. User-level only — a repository can never add a build step to your host.
+- **Egress allowlist, when you want it.** `sapi config set network allowlist`: a Rust sidecar owns the agent's network namespace — kernel-level redirection, fake DNS (no tunnelling), TLS-SNI and HTTP-Host filtering, connect-by-name. Only the hosts you list, on 80/443; everything else dropped and logged. Off by default.
 - **Persistent where it matters.** Credentials and settings live in one Docker volume; each project's sessions in another. Containers are disposable; `sapi` resumes or rebuilds them transparently.
-- **Hardened by default.** All Linux capabilities dropped except the few needed to drop privileges; `no-new-privileges`; no Docker socket; no host network.
+- **Hardened by default.** All Linux capabilities dropped except the few needed to drop privileges; `no-new-privileges`; no Docker socket; no host network; optional cpu/memory/pid ceilings.
 - **Always current.** `pi` self-updates on every start. If that fails (offline), it just starts.
 
 ## Install
@@ -87,6 +88,8 @@ All optional, all environment variables:
 | `SAPI_CPUS` / `SAPI_MEMORY_MIB` / `SAPI_PIDS` | unlimited / unlimited / `4096` | resource ceilings for the agent container |
 | `SAPI_PACKAGES` | | extra Debian packages baked into the image, e.g. `"golang make"` ([details](docs/toolchain.md)) |
 | `SAPI_DOCKERFILE_EXTRA` | `~/.config/sapi/Dockerfile.extra` | Dockerfile fragment appended when the file exists |
+| `SAPI_NETWORK` | `full` | `allowlist` restricts egress to `SAPI_ALLOW` on 80/443 ([details](docs/network.md)) |
+| `SAPI_ALLOW` | `@providers` | hosts, `*.suffix`, `host:port`, presets `@providers @github @npm @pypi @cargo @go @debian @huggingface` |
 | `SAPI_MODEL` | *(pi decides)* | Passed to `pi --model`, e.g. `openrouter/anthropic/claude-sonnet-4.5` |
 | `SAPI_PI_VERSION` | `latest` | pi npm version baked into the image |
 | `SAPI_AUTO_UPDATE` | `1` | `0` disables `pi update` on container start |
@@ -111,14 +114,25 @@ Every setting can also be set once in `~/.config/sapi/config` (`sapi config set 
 
 `sapi` hashes its embedded Dockerfile to name the image, so changing the definition (or upgrading `sapi`) naturally produces a fresh image. Containers are labelled with the workspace path, image, and settings; on start, `sapi` resumes a matching stopped container, replaces a stale one, or allocates a new slot if one is already running. Sessions survive all of this because they live in a volume.
 
-More: [architecture](docs/architecture.md) · [security model](docs/security.md) · [recovery: backup · run · diff · restore](docs/recovery.md) · [toolchain](docs/toolchain.md) · [troubleshooting](docs/troubleshooting.md)
+More: [architecture](docs/architecture.md) · [security model](docs/security.md) · [recovery: backup · run · diff · restore](docs/recovery.md) · [toolchain](docs/toolchain.md) · [network egress allowlist](docs/network.md) · [troubleshooting](docs/troubleshooting.md)
+
+## Repository
+
+```
+sapi             launcher (bash): everything the user runs; embedded Dockerfile and entrypoint
+install.sh       installer
+egress/          sapi-egress (Rust): the optional network allowlist sidecar
+docs/            recovery · toolchain · network · architecture · security · troubleshooting
+test/            check.sh (no Docker) · smoke.sh (real Docker, incl. the firewall)
+```
 
 ## Contributing
 
-The whole project is two scripts. Keep it that way.
+The launcher is one readable file and stays that way; anything long-running or security-critical is a small Rust binary with its own tests.
 
 - `sapi` — launcher, embedded Dockerfile and entrypoint
 - `install.sh` — installer
+- `egress/` — sidecar: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `test/check.sh` — lint and unit checks (no Docker needed)
 - `test/smoke.sh` — builds the image and exercises it (needs Docker)
 

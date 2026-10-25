@@ -5,12 +5,21 @@
 # One file. No dependencies beyond bash, docker and coreutils.
 set -Eeuo pipefail
 
-readonly SAPI_VERSION="0.4.0"
+readonly SAPI_VERSION="0.5.0"
 readonly SAPI_REPO="${SAPI_REPO:-sapiensmalti/sapi}"
 readonly SAPI_REF="${SAPI_REF:-main}"
 readonly IMAGE_REPOSITORY="sapi"
 readonly CONFIG_VOLUME="${SAPI_CONFIG_VOLUME:-sapi-config}"
 readonly LABEL="sh.sapi"
+
+# Egress sidecar (network = allowlist). Pinned by digest; the source tarball
+# of the same tag is pinned by checksum for SAPI_EGRESS_BUILD=1. Both are
+# produced by .github/workflows/egress-image.yml from egress/ in this repo.
+readonly EGRESS_VERSION="0.1.0"
+readonly EGRESS_IMAGE="${SAPI_EGRESS_IMAGE:-ghcr.io/sapiensmalti/sapi-egress@sha256:ce6f5cd657c58262f5161800410c4758d53f8283d6b006ed03c619454c351f3e}"
+readonly EGRESS_SOURCE_URL="https://github.com/sapiensmalti/sapi/releases/download/egress-v$EGRESS_VERSION/sapi-egress-src-$EGRESS_VERSION.tar.gz"
+readonly EGRESS_SOURCE_SHA256="6a02426e7c8c5de8b1304e78e97ae4b9305de4a0bcd55f045cde5ad720a4e0f2"
+readonly EGRESS_LOCAL_IMAGE="sapi-egress:$EGRESS_VERSION"
 
 # ---------------------------------------------------------------------------
 # Image definition. Embedded so that `sapi` is a single file.
@@ -76,6 +85,16 @@ readonly DOCKERFILE
 die() { printf 'sapi: %s\n' "$*" >&2; exit 1; }
 log() { printf 'sapi: %s\n' "$*" >&2; }
 
+# One exit hook for every transient resource; each is a no-op until set.
+BACKUP_PARTIAL=""; DIFF_TMP=""; EGRESS_STOP_NAME=""
+on_exit() {
+    [[ -n "$BACKUP_PARTIAL" ]] && rm -f -- "$BACKUP_PARTIAL"
+    [[ -n "$DIFF_TMP" ]] && rm -rf -- "$DIFF_TMP"
+    [[ -n "$EGRESS_STOP_NAME" ]] && docker stop --time 5 "$EGRESS_STOP_NAME" >/dev/null 2>&1
+    return 0
+}
+trap on_exit EXIT
+
 usage() {
     cat <<EOF
 sapi $SAPI_VERSION — the pi coding agent, isolated in Docker, scoped to this directory.
@@ -98,6 +117,7 @@ Usage:
   sapi ls            List sapi containers
   sapi rm [--all]    Remove this directory's containers (or all of them)
   sapi shell [NAME]  Open a bash shell inside the running container
+  sapi netlog [NAME] Egress decisions (allow/deny, JSON lines) when network = allowlist
   sapi build         Build the image without starting a container
   sapi dockerfile    Print the embedded Dockerfile
   sapi upgrade       Upgrade sapi itself
@@ -119,6 +139,9 @@ Environment:
 
   SAPI_CPUS / SAPI_MEMORY_MIB / SAPI_PIDS
                       Resource ceilings for the agent container (default: unlimited / unlimited / 4096)
+  SAPI_NETWORK        full (default) | allowlist — see 'sapi config keys' and docs/network.md
+  SAPI_ALLOW          Allowed hosts/presets for allowlist mode (default: @providers)
+  SAPI_EGRESS_BUILD=1 Build the egress sidecar from pinned source instead of pulling the image
   SAPI_PACKAGES       Extra Debian packages baked into the image, e.g. "golang make"
   SAPI_DOCKERFILE_EXTRA
                       Dockerfile fragment appended to the image (default: ~/.config/sapi/Dockerfile.extra)
@@ -214,7 +237,7 @@ $(cat "$SET_dockerfile_extra")"
 # ---------------------------------------------------------------------------
 # Settings are declared once, here. Each has a type, an environment variable
 # and a default; the same table drives parsing, precedence and `sapi config`.
-readonly SETTING_KEYS="safer backup_dir backup_keep cpus memory_mib pids packages dockerfile_extra"
+readonly SETTING_KEYS="safer backup_dir backup_keep cpus memory_mib pids packages dockerfile_extra network allow"
 setting_spec() {  # $1 key -> "type env default"
     case "$1" in
         safer)       printf 'bool SAPI_SAFER false' ;;
@@ -225,6 +248,8 @@ setting_spec() {  # $1 key -> "type env default"
         pids)        printf 'uint SAPI_PIDS 4096' ;;
         packages)    printf 'packages SAPI_PACKAGES ' ;;
         dockerfile_extra) printf 'path SAPI_DOCKERFILE_EXTRA %s' "$(dirname "$CONFIG_FILE")/Dockerfile.extra" ;;
+        network)     printf 'network SAPI_NETWORK full' ;;
+        allow)       printf 'allow SAPI_ALLOW @providers' ;;
         *) return 1 ;;
     esac
 }
@@ -239,6 +264,9 @@ setting_help() {
   packages     list    extra Debian packages baked into the image, e.g. "golang make postgresql-client"
   dockerfile_extra path  Dockerfile fragment appended to the image when the file exists
                        (default: ~/.config/sapi/Dockerfile.extra; user-level only, never from a project)
+  network      enum    full (default) | allowlist — only hosts in 'allow' are reachable, on 80/443
+  allow        list    hosts for network = allowlist: host, *.suffix, host:port, or presets
+                       @providers @github @npm @pypi @cargo @go @debian @huggingface  (default: @providers)
 HELP
 }
 
@@ -257,6 +285,22 @@ validate_setting() {  # $1 key, $2 value, $3 where (for messages)
         uint)   [[ "$v" =~ ^[0-9]+$ ]] || die "$where must be a non-negative integer, got '$v'"; printf '%s' "$v" ;;
         number) [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$where must be a non-negative number, got '$v'"; printf '%s' "$v" ;;
         path)   [[ "$v" == /* ]] || die "$where must be an absolute path, got '$v'"; printf '%s' "$v" ;;
+        network)
+            case "$v" in
+                full|allowlist) printf '%s' "$v" ;;
+                *) die "$where must be full or allowlist, got '$v'" ;;
+            esac ;;
+        allow)
+            local a out=""
+            for a in $(printf '%s' "$v" | tr ',' ' '); do
+                if [[ "$a" == @* ]]; then
+                    allow_preset "${a#@}" >/dev/null || die "$where: unknown preset '$a' (known: $(allow_presets))"
+                elif [[ ! "$a" =~ ^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$ || "$a" == *..* ]]; then
+                    die "$where: '$a' is not a hostname, *.suffix, host:port or @preset"
+                fi
+                out+="${out:+ }$a"
+            done
+            printf '%s' "$out" ;;
         packages)
             # Debian package names, whitespace or comma separated; normalised to one space.
             local p out=""
@@ -291,7 +335,128 @@ load_config() {
 # Effective settings into SET_<key> / SRC_<key>.
 # Precedence: flag > environment > config file > default.
 SAFER_FLAG=""   # set by --safer / --no-safer
-SET_safer=""; SET_backup_dir=""; SET_backup_keep=""; SET_cpus=""; SET_memory_mib=""; SET_pids=""; SET_packages=""; SET_dockerfile_extra=""
+SET_safer=""; SET_backup_dir=""; SET_backup_keep=""; SET_cpus=""; SET_memory_mib=""; SET_pids=""; SET_packages=""; SET_dockerfile_extra=""; SET_network=""; SET_allow=""
+
+# ---------------------------------------------------------------------------
+# Egress allowlist (network = allowlist)
+#
+# The agent container shares the network namespace of a sidecar that owns
+# the namespace firewall and a transparent filter: every uid but the
+# sidecar's own has DNS, 80 and 443 redirected to it and everything else
+# dropped. The sidecar answers DNS itself (allowed names get a sink address,
+# others NXDOMAIN), reads the TLS SNI or HTTP Host, checks the allowlist and
+# connects by *name*. The agent holds no network capabilities and cannot
+# change any of this. Source: egress/ in the sapi repository.
+# ---------------------------------------------------------------------------
+allow_presets() { printf '@providers @github @npm @pypi @cargo @go @debian @huggingface'; }
+allow_preset() {  # $1 name -> hosts, or return 1
+    case "$1" in
+        providers)   printf 'api.anthropic.com api.openai.com openrouter.ai generativelanguage.googleapis.com api.mistral.ai api.groq.com api.x.ai api.deepseek.com api.together.xyz api.fireworks.ai api.cerebras.ai api.cohere.com api.perplexity.ai' ;;
+        github)      printf 'github.com *.github.com *.githubusercontent.com codeload.github.com ghcr.io *.pkg.github.com' ;;
+        npm)         printf 'registry.npmjs.org *.npmjs.org nodejs.org' ;;
+        pypi)        printf 'pypi.org files.pythonhosted.org *.pypi.org' ;;
+        cargo)       printf 'crates.io static.crates.io index.crates.io static.rust-lang.org' ;;
+        go)          printf 'proxy.golang.org sum.golang.org' ;;
+        debian)      printf 'deb.debian.org security.debian.org' ;;
+        huggingface) printf 'huggingface.co *.huggingface.co cdn-lfs.huggingface.co' ;;
+        *) return 1 ;;
+    esac
+}
+# Expand presets into the concrete list handed to the sidecar.
+expand_allow() {
+    local a out=""
+    for a in $1; do
+        if [[ "$a" == @* ]]; then out+="${out:+ }$(allow_preset "${a#@}")"; else out+="${out:+ }$a"; fi
+    done
+    printf '%s' "$out"
+}
+allow_includes_preset() { [[ " $SET_allow " == *" @$1 "* ]]; }
+
+# Dockerfile that builds the sidecar from the pinned, checksummed source tarball.
+read -r -d '' EGRESS_DOCKERFILE <<'EGRESS_DOCKERFILE_EOF' || true
+# syntax=docker/dockerfile:1
+FROM rust:1-alpine AS builder
+ARG SRC_URL
+ARG SRC_SHA256
+RUN apk add --no-cache musl-dev curl
+WORKDIR /src
+RUN curl -fsSL --proto '=https' --tlsv1.2 "$SRC_URL" -o src.tar.gz \
+    && echo "$SRC_SHA256  src.tar.gz" | sha256sum -c - \
+    && tar -xzf src.tar.gz --strip-components=2 \
+    && cargo build --release --locked \
+    && cp target/release/sapi-egress /sapi-egress
+
+FROM alpine:3.20
+RUN apk add --no-cache iptables ip6tables \
+    && addgroup -g 65532 -S egress && adduser -u 65532 -S -G egress -H -s /sbin/nologin egress \
+    && mkdir -p /run/egress && chown 65532:65532 /run/egress
+COPY --from=builder /sapi-egress /usr/local/bin/sapi-egress
+ENTRYPOINT ["/usr/local/bin/sapi-egress"]
+EGRESS_DOCKERFILE_EOF
+readonly EGRESS_DOCKERFILE
+
+# Make the sidecar image available; sets EGRESS_IMAGE_REF.
+egress_image() {
+    if [[ "${SAPI_EGRESS_BUILD:-0}" == 1 ]]; then
+        EGRESS_IMAGE_REF="$EGRESS_LOCAL_IMAGE"
+        if ! docker image inspect "$EGRESS_IMAGE_REF" >/dev/null 2>&1; then
+            log "egress: building $EGRESS_IMAGE_REF from pinned source ($EGRESS_SOURCE_URL) ..."
+            local ctx; ctx="$(mktemp -d)"
+            printf '%s\n' "$EGRESS_DOCKERFILE" | DOCKER_BUILDKIT=1 docker build --tag "$EGRESS_IMAGE_REF" \
+                --build-arg "SRC_URL=$EGRESS_SOURCE_URL" --build-arg "SRC_SHA256=$EGRESS_SOURCE_SHA256" -f - "$ctx" \
+                || die "egress: source build failed"
+            rmdir "$ctx"
+        fi
+    else
+        EGRESS_IMAGE_REF="$EGRESS_IMAGE"
+        if ! docker image inspect "$EGRESS_IMAGE_REF" >/dev/null 2>&1; then
+            log "egress: pulling $EGRESS_IMAGE_REF ..."
+            docker pull --quiet "$EGRESS_IMAGE_REF" >/dev/null || die "egress: cannot pull $EGRESS_IMAGE_REF (offline? set SAPI_EGRESS_BUILD=1 to build from source)"
+        fi
+    fi
+}
+
+# Create and start the sidecar for agent container $1; wait until its
+# firewall is up. Dies, with the sidecar's log, if it does not come up.
+egress_start() {  # $1 agent container name, $2 extra docker run flags (e.g. --rm)
+    local agent="$1" extra="${2:-}" name="$1-egress"
+    egress_image
+    docker container rm --force "$name" >/dev/null 2>&1 || true
+    # shellcheck disable=SC2086
+    docker run --detach $extra --name "$name" --init \
+        --label "$LABEL.managed=true" --label "$LABEL.egress-of=$agent" --label "$LABEL.workspace-hash=$WORKSPACE_HASH" \
+        --env "EGRESS_ALLOW=$(expand_allow "$SET_allow")" \
+        --security-opt no-new-privileges --cap-drop ALL \
+        --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
+        --pids-limit 256 --memory 256m \
+        "$EGRESS_IMAGE_REF" >/dev/null || die "egress: could not start sidecar"
+    egress_wait "$name"
+}
+
+egress_wait() {
+    local name="$1"
+    for _ in $(seq 1 100); do
+        if docker exec "$name" test -f /run/egress/ready 2>/dev/null; then
+            return 0
+        fi
+        if [[ "$(inspect "$name" '{{.State.Running}}')" != true ]]; then break; fi
+        sleep 0.1
+    done
+    docker logs "$name" 2>&1 | tail -n 20 >&2
+    die "egress: sidecar $name did not become ready; the agent was not started"
+}
+
+cmd_netlog() {
+    require_docker
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        name="$(docker container ls --all --filter "label=$LABEL.workspace-hash=$WORKSPACE_HASH" --filter "label=$LABEL.egress-of" --format '{{.Names}}' | head -n1)"
+        [[ -n "$name" ]] || die "netlog: no egress sidecar for $WORKSPACE (network = allowlist not in use?)"
+    else
+        [[ "$name" == *-egress ]] || name="$name-egress"
+    fi
+    exec docker logs "$name"
+}
 resolve_settings() {
     load_config
     local key spec env default cfg_var env_val
@@ -386,7 +551,6 @@ backup_create() {
     name="$stamp.tar.gz"
     final="$root/$name"; partial="$root/.$name.partial"
     BACKUP_PARTIAL="$partial"
-    trap '[[ -n "${BACKUP_PARTIAL:-}" ]] && rm -f -- "$BACKUP_PARTIAL"' EXIT
 
     log "backup: archiving $WORKSPACE (~$((need / 1024)) MiB) ..."
     local started rc=0
@@ -517,6 +681,7 @@ cmd_rm() {
         docker container rm --force "$n" >/dev/null && log "removed container $n"
         [[ -n "$vol" ]] && docker volume rm "$vol" >/dev/null 2>&1 && log "removed volume $vol"
     done
+    # Sidecars carry the same workspace label and are removed in the same pass.
     log "kept config volume $CONFIG_VOLUME (credentials). Remove with: docker volume rm $CONFIG_VOLUME"
 }
 
@@ -542,7 +707,8 @@ cmd_upgrade() {
 # per line (read back into an array by the callers).
 container_args() {  # $1 container name, $2 sessions volume
     local name="$1" sessions="$2"
-    local -a a=(--init --name "$name" --hostname sapi
+    local -a a=(--init --name "$name"
+        --label "$LABEL.network=$NETWORK_SIGNATURE"
         --label "$LABEL.managed=true" --label "$LABEL.version=$SAPI_VERSION"
         --label "$LABEL.workspace=$WORKSPACE" --label "$LABEL.workspace-hash=$WORKSPACE_HASH"
         --label "$LABEL.model=$MODEL" --label "$LABEL.user=$UID_:$GID_" --label "$LABEL.auto-update=$AUTO_UPDATE"
@@ -552,10 +718,16 @@ container_args() {  # $1 container name, $2 sessions volume
         --workdir /workspace
         --env PI_CODING_AGENT_DIR=/pi-config --env PI_CODING_AGENT_SESSION_DIR=/pi-sessions
         --env GIT_CONFIG_GLOBAL=/pi-config/gitconfig
-        --env "SAPI_AUTO_UPDATE=$AUTO_UPDATE" --env "SAPI_UID=$UID_" --env "SAPI_GID=$GID_"
+        --env "SAPI_AUTO_UPDATE=$AUTO_UPDATE_EFFECTIVE" --env "SAPI_UID=$UID_" --env "SAPI_GID=$GID_"
         --security-opt no-new-privileges --cap-drop ALL
         --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER
         --cap-add SETUID --cap-add SETGID --cap-add SETPCAP)
+    if [[ "$SET_network" == allowlist ]]; then
+        # Share the sidecar's network namespace: its firewall is our firewall.
+        a+=(--network "container:$name-egress")
+    else
+        a+=(--hostname sapi)
+    fi
     # Resource ceilings (0 = unlimited).
     [[ "$SET_cpus" != 0 && "$SET_cpus" != 0.0 ]] && a+=(--cpus "$SET_cpus")
     [[ "$SET_memory_mib" != 0 ]] && a+=(--memory "${SET_memory_mib}m")
@@ -580,9 +752,23 @@ attach() {
     exec docker start --attach --interactive "$name"
 }
 
+# Everything the network mode implies, computed once per command.
+prepare_network() {
+    NETWORK_SIGNATURE="$SET_network"
+    AUTO_UPDATE_EFFECTIVE="$AUTO_UPDATE"
+    if [[ "$SET_network" == allowlist ]]; then
+        NETWORK_SIGNATURE="allowlist:$(printf '%s' "$(expand_allow "$SET_allow")" | sha256 | cut -c1-12)"
+        if [[ "$AUTO_UPDATE" == 1 ]] && ! allow_includes_preset npm; then
+            AUTO_UPDATE_EFFECTIVE=0
+            log "network: allowlist without @npm; skipping pi self-update on start"
+        fi
+    fi
+}
+
 cmd_start() {
     [[ -t 0 && -t 1 ]] || die "an interactive terminal is required"
     resolve_settings
+    prepare_network
     cmd_build
     # Snapshot the directory right before the agent gets access to it.
     BACKUP_PATH=""
@@ -616,7 +802,19 @@ cmd_start() {
                     && "$(label "$name" version)" == "$SAPI_VERSION" \
                     && "$(label "$name" model)" == "$MODEL" \
                     && "$(label "$name" user)" == "$UID_:$GID_" \
-                    && "$(label "$name" auto-update)" == "$AUTO_UPDATE" ]]; then
+                    && "$(label "$name" auto-update)" == "$AUTO_UPDATE_EFFECTIVE" \
+                    && "$(label "$name" network)" == "$NETWORK_SIGNATURE" ]]; then
+                    if [[ "$SET_network" == allowlist ]]; then
+                        # The firewall must be up before the agent's namespace comes back.
+                        if docker container inspect "$name-egress" >/dev/null 2>&1; then
+                            docker start "$name-egress" >/dev/null || die "egress: cannot start sidecar $name-egress"
+                            egress_wait "$name-egress"
+                        else
+                            log "refreshing $name (its egress sidecar is gone)"
+                            docker container rm --force "$name" >/dev/null
+                            break
+                        fi
+                    fi
                     log "resuming $name"
                     attach "$name"
                 fi
@@ -634,6 +832,7 @@ cmd_start() {
     local -a args=()
     while IFS= read -r line; do args+=("$line"); done < <(container_args "$name" "$sessions")
 
+    [[ "$SET_network" == allowlist ]] && egress_start "$name"
     docker create --interactive --tty \
         --label "$LABEL.sessions-volume=$sessions" \
         "${args[@]}" \
@@ -669,6 +868,7 @@ cmd_run() {
     [[ -n "${task//[[:space:]]/}" ]] || die "usage: sapi run [--json] [--timeout SECONDS] TASK  (or '-' to read TASK from stdin)"
 
     resolve_settings
+    prepare_network
     cmd_build
     BACKUP_PATH=""
     [[ "$SAFER" == true ]] && backup_create
@@ -691,6 +891,10 @@ cmd_run() {
     local started rc=0
     started="$(date +%s)"
     log "run: $name"
+    if [[ "$SET_network" == allowlist ]]; then
+        egress_start "$name" --rm
+        EGRESS_STOP_NAME="$name-egress"
+    fi
     # docker run in the background so a timeout can stop it cleanly; stdout
     # flows straight through to ours.
     docker run --rm --label "$LABEL.run=true" "${args[@]}" "$IMAGE" "${pi_args[@]}" &
@@ -743,7 +947,6 @@ cmd_diff() {
         [[ "$(awk '{print $1}' "$file.sha256")" == "$(sha256 <"$file")" ]] || die "diff: checksum mismatch for $file"
     fi
     DIFF_TMP="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/sapi-diff.XXXXXX")"
-    trap 'rm -rf -- "${DIFF_TMP:-}"' EXIT
     local tmp="$DIFF_TMP"
     mkdir -p "$tmp/before"
     tar -xzf "$file" -C "$tmp/before" --strip-components=1 || die "diff: cannot extract $file"
@@ -805,6 +1008,7 @@ case "${1:-}" in
     ls)         cmd_ls ;;
     rm)         cmd_rm "${2:-}" ;;
     shell)      cmd_shell "${2:-}" ;;
+    netlog)     cmd_netlog "${2:-}" ;;
     upgrade)    cmd_upgrade ;;
     *)          [[ $# -eq 1 ]] || die "expected at most one container name (see sapi help)"
                 cmd_start "$1" ;;
