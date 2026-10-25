@@ -12,6 +12,21 @@ jobs:
       - run: sudo apt-get install -y shellcheck
       - run: test/check.sh
 
+  egress:
+    name: egress (fmt, clippy, tests, image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: egress
+      - run: cd egress && cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked
+      - run: docker build -f egress/Dockerfile -t sapi-egress:ci egress
+      - run: docker run --rm sapi-egress:ci --version
+
   smoke:
     runs-on: ubuntu-latest
     needs: check
