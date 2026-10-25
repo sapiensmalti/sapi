@@ -80,6 +80,57 @@ pub fn rules(uid: u32, ports: Ports) -> Vec<(&'static str, Vec<String>)> {
             "ACCEPT",
         ]),
         v4(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]),
+        // Redirected packets still carry their original output interface when
+        // the filter hook runs; only the destination has become 127.0.0.1.
+        // Accept exactly our three listener ports there and nothing else.
+        v4(&[
+            "-A",
+            "OUTPUT",
+            "-d",
+            "127.0.0.1",
+            "-p",
+            "udp",
+            "--dport",
+            &dns,
+            "-j",
+            "ACCEPT",
+        ]),
+        v4(&[
+            "-A",
+            "OUTPUT",
+            "-d",
+            "127.0.0.1",
+            "-p",
+            "tcp",
+            "--dport",
+            &dns,
+            "-j",
+            "ACCEPT",
+        ]),
+        v4(&[
+            "-A",
+            "OUTPUT",
+            "-d",
+            "127.0.0.1",
+            "-p",
+            "tcp",
+            "--dport",
+            &tls,
+            "-j",
+            "ACCEPT",
+        ]),
+        v4(&[
+            "-A",
+            "OUTPUT",
+            "-d",
+            "127.0.0.1",
+            "-p",
+            "tcp",
+            "--dport",
+            &http,
+            "-j",
+            "ACCEPT",
+        ]),
         v4(&[
             "-A",
             "OUTPUT",
@@ -225,10 +276,34 @@ mod tests {
             .unwrap();
         let redirect_at = joined.iter().position(|l| l.contains("REDIRECT")).unwrap();
         assert!(drop_at < redirect_at);
-        // Nothing ever ACCEPTs non-loopback traffic for other uids.
-        assert!(!joined.iter().any(|l| l.contains("-j ACCEPT")
-            && !l.contains("lo")
-            && !l.contains("uid-owner")
-            && !l.contains("conntrack")));
+        // Every ACCEPT is one of: loopback interface, a redirected destination
+        // on one of our three ports, the proxy's uid, or an established reply.
+        for l in joined.iter().filter(|l| l.contains("-j ACCEPT")) {
+            assert!(
+                l.contains(" lo ")
+                    || l.contains("-d 127.0.0.1 ")
+                    || l.contains("uid-owner")
+                    || l.contains("conntrack"),
+                "unexpected ACCEPT: {l}"
+            );
+        }
+        assert_eq!(
+            joined
+                .iter()
+                .filter(|l| l.contains("-d 127.0.0.1 "))
+                .count(),
+            4
+        );
+        for p in ["15053", "15443", "15080"] {
+            assert!(
+                joined
+                    .iter()
+                    .any(|l| l.contains(&format!("-d 127.0.0.1 -p tcp --dport {p} -j ACCEPT"))),
+                "{p}"
+            );
+        }
+        assert!(joined
+            .iter()
+            .any(|l| l.contains("-d 127.0.0.1 -p udp --dport 15053 -j ACCEPT")));
     }
 }
