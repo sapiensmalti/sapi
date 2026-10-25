@@ -880,7 +880,7 @@ cmd_rm() {
         vol="$(label "$n" sessions-volume)"
         [[ -n "$vol" ]] && volumes+="$vol"$'\n'
     done
-    volumes+="$(docker volume ls "${vfilter[@]}" --format '{{.Names}}')"$'\n'
+    volumes+="$(docker volume ls "${vfilter[@]}" --format '{{.Name}}')"$'\n'
     if (( all == 0 )); then
         # Headless-run volumes created before volume labels were introduced.
         local ws base

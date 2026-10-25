@@ -62,7 +62,7 @@ jobs:
           brew install colima docker docker-buildx qemu
           mkdir -p "$HOME/.docker/cli-plugins"
           ln -sf "$(brew --prefix)/opt/docker-buildx/bin/docker-buildx" "$HOME/.docker/cli-plugins/docker-buildx"
-          if ! colima start --vm-type=vz --cpu 2 --memory 4 --disk 20; then
+          if ! colima start --vm-type=qemu --cpu 2 --memory 4 --disk 20; then
             find "$HOME/.colima" -type f -name '*.log' -maxdepth 6 -print -exec tail -n 80 {} \;
             exit 1
           fi
