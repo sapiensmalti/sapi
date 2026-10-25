@@ -40,7 +40,7 @@ sapi protects against an agent that is **careless or misled** — it runs `rm -r
 sapi does **not** protect against:
 
 - **Docker/kernel escapes.** Containers are a strong boundary but not a VM. If this matters to you, run sapi inside a VM.
-- **Harm to the mounted directory itself.** The agent can delete or rewrite everything in it. Use git. Commit before you let it loose.
+- **Harm to the mounted directory itself.** The agent can delete or rewrite everything in it. Use git, commit first, and turn on [safer mode](backups.md) — a complete backup before every start, stored outside the directory.
 - **Exfiltration over the network.** The agent has internet. Secrets inside the mounted directory (`.env` files, keys) are readable by it and by whatever model provider you use. Keep secrets out of directories you hand to an agent.
 - **A compromised upstream.** sapi installs `pi` from npm and base images from Docker Hub/GHCR at build time, and `pi` self-updates on start. Set `SAPI_AUTO_UPDATE=0` and pin `SAPI_PI_VERSION` if you need reproducibility over freshness.
 

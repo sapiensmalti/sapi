@@ -53,6 +53,18 @@ Set your identity once; it is stored in the config volume and survives container
 Nothing from your host environment is passed in by default. Opt in per variable:
 `SAPI_ENV="GH_TOKEN ANTHROPIC_API_KEY" sapi`. Only pass what the task needs.
 
+**`sapi: backup: … is inside …`**
+You ran sapi in a directory that contains the backup folder (for example your home directory). Point `SAPI_BACKUP_DIR` or `backup_dir` somewhere outside it.
+
+**`sapi: backup: not enough space`**
+The destination has less free space than the directory is large. Free space, or set `backup_dir` to another volume. Backups are never skipped silently in safer mode.
+
+**`sapi: unknown setting` on start**
+A typo in `~/.config/sapi/config`. Known keys: `safer`, `backup_dir`, `backup_keep`. `sapi config path` prints the file.
+
+**Backups are slow or large**
+They include everything, by design. Keep build output and `node_modules` out of directories you run sapi in, or accept the cost. `backup_keep` bounds how many are kept.
+
 **Still stuck**
 Run `sapi dockerfile` and `docker info`, and open an issue with the output and your OS.
 

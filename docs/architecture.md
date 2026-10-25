@@ -52,6 +52,10 @@ exec pi "$@"
 
 The update runs as root because npm's global prefix is root-owned; then privileges are dropped for good. On macOS the default is uid 0 because Docker Desktop and OrbStack translate ownership on bind mounts themselves; on Linux the bind mount is the real filesystem, so matching your uid is what keeps `git status` clean and `rm` working afterwards.
 
+## Safer mode
+
+Optional, off by default. When on, `cmd_start` calls `backup_create` after the image is built and before any container is created or resumed: a complete `tar.gz` of the directory, verified and checksummed, stored outside it. Settings resolve as flag > environment > config file > default; the config file is whitelist-parsed, never sourced. Details and guarantees in [backups.md](backups.md).
+
 ## Why bash, not Rust
 
 Docker is doing the heavy lifting: isolation, image caching, lifecycle. The launcher is glue. Glue in bash is auditable in one sitting by anyone, has zero build step, zero dependencies, and ships as a text file. A Rust binary would need per-platform builds, signing on macOS, and a release pipeline — cost with no benefit at this size. If sapi ever grows a long-running component (a daemon, a swarm coordinator, an API), that is where Rust belongs.
