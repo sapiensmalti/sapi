@@ -47,7 +47,7 @@ check "rejects a non-sapi download"  bash -c "! SAPI_URL=file://$tmp/bad SAPI_IN
 check "no stray files"               test ! -e "$tmp/bin2"
 
 echo "config"
-REAL_HOME="$HOME"; export HOME; HOME="$(mktemp -d)"; proj="$HOME/proj"; mkdir -p "$proj/sub"; echo a >"$proj/a.txt"; echo b >"$proj/sub/b.txt"; ln -s a.txt "$proj/link"; chmod 600 "$proj/a.txt"
+REAL_HOME="$HOME"; export HOME; HOME="$(mktemp -d)"; export SAPI_CONFIG_FILE="$HOME/.config/sapi/config"; proj="$HOME/proj"; mkdir -p "$proj/sub"; echo a >"$proj/a.txt"; echo b >"$proj/sub/b.txt"; ln -s a.txt "$proj/link"; chmod 600 "$proj/a.txt"
 S="$PWD/sapi"
 check "defaults: safer off"           bash -c "cd $proj && $S config show | grep -q 'safer *false *(default)'"
 check "config set safer"              bash -c "cd $proj && $S config set safer yes && grep -qx 'safer = true' \$($S config path)"
@@ -88,7 +88,7 @@ printf '#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted"
 check "insufficient space aborts"    bash -c "cd $proj && ! PATH=$shim:\$PATH $S backup"
 check "prunes to backup_keep"        bash -c "cd $proj && for i in 1 2 3 4; do sleep 1; SAPI_BACKUP_KEEP=2 $S backup >/dev/null 2>&1; done; [[ \$($S backups | wc -l) == 2 ]] && [[ \$(ls '$(dirname "$b")' | wc -l) == 6 ]]"
 check "backup_keep=0 keeps all"      bash -c "cd $proj && SAPI_BACKUP_KEEP=0 $S backup >/dev/null 2>&1 && [[ \$($S backups | wc -l) == 3 ]]"
-rm -rf "$HOME" "$shim"; HOME="$REAL_HOME"
+rm -rf "$HOME" "$shim"; HOME="$REAL_HOME"; unset SAPI_CONFIG_FILE
 
 echo "hygiene"
 check "LICENSE present"              test -f LICENSE
