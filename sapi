@@ -15,10 +15,10 @@ readonly LABEL="sh.sapi"
 # Egress sidecar (network = allowlist). Pinned by digest; the source tarball
 # of the same tag is pinned by checksum for SAPI_EGRESS_BUILD=1. Both are
 # produced by .github/workflows/egress-image.yml from egress/ in this repo.
-readonly EGRESS_VERSION="0.1.0"
-readonly EGRESS_IMAGE="${SAPI_EGRESS_IMAGE:-ghcr.io/sapiensmalti/sapi-egress@sha256:ce6f5cd657c58262f5161800410c4758d53f8283d6b006ed03c619454c351f3e}"
+readonly EGRESS_VERSION="0.1.1"
+readonly EGRESS_IMAGE="${SAPI_EGRESS_IMAGE:-ghcr.io/sapiensmalti/sapi-egress@sha256:0cb63c5375d75d8fc5c4d0529b60ddd7d19d35c0333fea74a8cc8504045fee08}"
 readonly EGRESS_SOURCE_URL="https://github.com/sapiensmalti/sapi/releases/download/egress-v$EGRESS_VERSION/sapi-egress-src-$EGRESS_VERSION.tar.gz"
-readonly EGRESS_SOURCE_SHA256="6a02426e7c8c5de8b1304e78e97ae4b9305de4a0bcd55f045cde5ad720a4e0f2"
+readonly EGRESS_SOURCE_SHA256="536b0090c395f764291b1f6d9774837dda74a3b9e5489c60acc331a4cc1640e2"
 readonly EGRESS_LOCAL_IMAGE="sapi-egress:$EGRESS_VERSION"
 
 # ---------------------------------------------------------------------------
