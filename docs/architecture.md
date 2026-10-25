@@ -52,9 +52,11 @@ exec pi "$@"
 
 The update runs as root because npm's global prefix is root-owned; then privileges are dropped for good. On macOS the default is uid 0 because Docker Desktop and OrbStack translate ownership on bind mounts themselves; on Linux the bind mount is the real filesystem, so matching your uid is what keeps `git status` clean and `rm` working afterwards.
 
-## Safer mode
+## Safer mode, run, diff
 
-Optional, off by default. When on, `cmd_start` calls `backup_create` after the image is built and before any container is created or resumed: a complete `tar.gz` of the directory, verified and checksummed, stored outside it. Settings resolve as flag > environment > config file > default; the config file is whitelist-parsed, never sourced. Details and guarantees in [backups.md](backups.md).
+Settings are table-driven (`setting_spec`): one line per key gives type, environment variable and default; parsing, precedence (flag > environment > config file > default) and `sapi config` all read that table. The config file is whitelist-parsed, never sourced.
+
+`container_args` is the single source of the container specification — mounts, environment, hardening, resource ceilings — used by both the interactive start and `sapi run`. When safer mode is on, `backup_create` runs after the image build and before any container exists; `sapi run` additionally writes a run manifest beside the backup. `sapi diff` extracts the backup to a private temp dir and uses portable `diff -rq`. Guarantees and the unattended workflow are in [recovery.md](recovery.md).
 
 ## Why bash, not Rust
 

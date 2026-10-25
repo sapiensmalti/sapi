@@ -1,0 +1,148 @@
+# Recovery: backup → run → diff → restore
+
+The sandbox stops the agent from touching anything *outside* the directory you run `sapi` in. It does nothing about what happens *inside* it. This page is about the inside: how to always be able to see what the agent did and to take it back — interactively, or unattended from a cron job.
+
+Four commands, one loop:
+
+| | Command | What you get |
+|---|---|---|
+| **before** | `sapi --safer` / `sapi config set safer true` | a complete, checksummed backup, taken immediately before the agent gets access |
+| **during** | `sapi run TASK` | one headless task; final message on stdout; the agent's exit code |
+| **after** | `sapi diff` | every path added, modified or deleted since the backup; `--full` for the hunks |
+| **undo** | `sapi restore latest --files PATH…` / `sapi restore latest` | put back selected files in place, or the whole tree beside the original |
+
+## Safer mode
+
+Three ways to enable it, in order of precedence (higher wins):
+
+```sh
+sapi --safer                 # this run only  (--no-safer forces it off)
+SAPI_SAFER=1 sapi            # this shell
+sapi config set safer true   # always, for this user
+```
+
+`sapi config show` prints every effective setting and where it came from.
+
+### What a backup is
+
+A `tar.gz` of the whole directory, taken from its parent, so the archive contains `<dirname>/…`. Symlinks are stored as symlinks. Modes and timestamps are preserved. Nothing is excluded — not `.git`, not `node_modules`, not `.env`. A backup that leaves things out is not a backup.
+
+It is stored **outside** the directory, where the agent cannot reach it:
+
+```
+~/.local/share/sapi/backups/<dirname>-<hash>/
+    20261025T074811Z.tar.gz            the archive            (mode 0600)
+    20261025T074811Z.tar.gz.sha256     checksum, sha256sum -c format
+    20261025T074811Z.tar.gz.manifest   source, time, size, entry count, sha256, tar exit code, duration
+    20261025T074811Z.tar.gz.run        (after `sapi run`) task, container, start/finish, exit code, model
+```
+
+`<hash>` is derived from the absolute path, so two directories with the same name never share a folder. Names are UTC timestamps and sort chronologically; a same-second collision waits for the next second rather than adding a suffix. Change the root with `SAPI_BACKUP_DIR` or `backup_dir`.
+
+### How it is made
+
+1. **Preconditions**: `tar` exists; the directory is not `/`; the backup root is not inside the directory (checked textually *and* after resolving symlinks, before anything is created); free space at the destination exceeds the directory's size plus a margin.
+2. `tar -czf` into a hidden `.partial` file. GNU tar's exit 1 ("file changed as we read it") is recorded as a warning in the manifest; anything worse aborts.
+3. The archive is re-read in full (`tar -tzf`) to prove it is readable and non-empty.
+4. SHA-256 is computed; the file is renamed into place; sidecar and manifest are written.
+5. Backups beyond `backup_keep` (default 10; `0` = keep all) are pruned, oldest first — only files sapi created, only in that directory's folder.
+
+If any step fails, **the launch is aborted** with the reason and no partial file is left behind. The container is created only after step 5, so what the agent sees is exactly what was archived.
+
+## `sapi run`: headless
+
+```sh
+sapi run "Update CHANGELOG.md from the git log since the last tag."
+sapi run --timeout 900 "Fix every failing test in packages/api."
+echo "Summarise this repository in 10 lines." | sapi run -
+sapi run --json "…" > events.jsonl          # pi's full event stream instead of the final message
+```
+
+- One ephemeral container (`--rm`), the same mounts, hardening and resource ceilings as interactive mode.
+- Final assistant message on **stdout**; sapi's own progress on **stderr**; exit code = the agent's exit code (`124` on `--timeout`).
+- Project-local pi files (`.pi/`) are **not** trusted (`--no-approve`): an unattended run must not pick up extensions from the tree it is editing.
+- No TTY required. It composes with everything: pipes, `xargs -P`, Makefiles, CI, cron.
+
+### Resource ceilings
+
+Both modes honour `cpus`, `memory_mib` and `pids` (`SAPI_CPUS`, `SAPI_MEMORY_MIB`, `SAPI_PIDS`, or the config file). Defaults: unlimited, unlimited, 4096 processes. A confused agent running a fork bomb or an unbounded build should not take the host down with it.
+
+## `sapi diff`: what changed
+
+```
+$ sapi diff
+M  src/auth/session.ts
+A  src/auth/session.test.ts
+D  src/auth/legacy.ts
+sapi: diff: 1 added, 1 modified, 1 deleted · vs 20261025T074811Z.tar.gz · run exit 0
+```
+
+Compares the directory **now** against the latest backup (or a given one: `sapi diff FILE`). The backup's checksum is verified first. `--full` appends a unified diff (`--- backup/…`, `+++ now/…`). Exit status follows `diff(1)`: `0` no changes, `1` changes, `>1` trouble — so `sapi diff || notify` works.
+
+It needs no git. It works when the project is not a repository, when `.git` itself was deleted, and for files git would ignore.
+
+## `sapi restore`: take it back
+
+```sh
+sapi restore latest --files src/auth/legacy.ts src/auth/session.ts   # just these, in place
+sapi restore latest                                                 # whole tree → ../<dirname>.restored-<stamp>/
+sapi restore FILE /some/empty/dir                                   # whole tree → there
+```
+
+- Restore verifies the checksum and refuses a corrupt archive.
+- **Whole-tree restore never writes into the original directory.** It extracts into a new or empty directory; compare with `diff -r`, then decide what to move.
+- **`--files` is the only in-place operation**, and it touches exactly the paths you name — relative, inside the directory, present in the backup; anything else is refused. It is the right tool for "undo that one file".
+- Everything is standard tar: without sapi, `tar -xzf FILE` does the same.
+
+## Unattended: auditable and reversible by construction
+
+Put safer mode and `run` together and every automated task leaves a complete, independent record:
+
+```sh
+# crontab: nightly, 15-minute budget, logs kept with the backups
+0 2 * * *  cd ~/code/service && SAPI_SAFER=1 ~/.local/bin/sapi run --timeout 900 \
+             "Review yesterday's commits for security issues; fix trivial ones; summarise the rest in REVIEW.md" \
+             >> ~/.local/share/sapi/backups/service-*/cron.log 2>&1
+```
+
+What exists the next morning, for that one run, all outside the agent's reach:
+
+| Artifact | Answers |
+|---|---|
+| `<stamp>.tar.gz` + `.sha256` + `.manifest` | *What did the tree look like before?* — complete, verified, restorable |
+| `<stamp>.tar.gz.run` | *What was it asked, when, how long, which model, how did it exit?* |
+| `cron.log` (stdout + stderr) | *What did it say?* — its final message, plus sapi's own lines |
+| `sapi diff <stamp>.tar.gz` | *What did it actually change?* — every path, with hunks on request |
+| `sapi restore <stamp>.tar.gz --files …` | *Undo exactly that* — one file or the whole tree, without touching anything else |
+
+Each night's run gets its own backup, so the chain of backups is a chain of before-states; `backup_keep` bounds how far back it reaches. This is auditability (every input and output of the run is recorded, independently of the agent and independently of git) and reversibility (any subset of its effects can be undone, verified against a checksum) — with zero cooperation required from the agent, the model, or the repository.
+
+A review workflow that fits in one line:
+
+```sh
+sapi diff >/dev/null || { sapi diff --full | less; }     # anything changed? show me
+```
+
+## Config file
+
+`~/.config/sapi/config` (or `$XDG_CONFIG_HOME/sapi/config`; override with `SAPI_CONFIG_FILE`):
+
+```
+# sapi settings
+safer = true
+backup_dir = /Volumes/External/sapi-backups
+backup_keep = 10
+cpus = 4
+memory_mib = 8192
+pids = 4096
+```
+
+Rules: `key = value`, `#` comments, lower-case keys (`sapi config keys` lists them with their types), booleans as `true/false/yes/no/on/off/1/0`, paths absolute, counts non-negative integers. The file is parsed, never sourced. An unknown key or invalid value makes sapi refuse to start — a safety setting silently ignored because of a typo would be worse than no setting at all. `sapi config set` writes the file atomically with mode 0600 and preserves other lines.
+
+## Costs and limits
+
+- **Time and disk.** A backup of a directory with a large `node_modules` or build output takes as long as tarring it. Each run adds one archive; pruning bounds the count, not the size. Put `backup_dir` on a volume with room.
+- **Point in time, not crash-consistent.** Files written by other programs during the second or two of archiving may be captured mid-write. sapi reports this (`tar_exit = 1` in the manifest).
+- **Secrets travel with it.** The archive contains whatever the directory contains. It is `0600` in a `0700` folder; it is not encrypted.
+- **Not off-site.** The backup lives on the same machine. It protects against the agent, not against the disk.
+- **`diff` extracts the backup** to a private temporary directory to compare; for very large trees that costs time and `$TMPDIR` space.

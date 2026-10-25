@@ -5,7 +5,7 @@
 # One file. No dependencies beyond bash, docker and coreutils.
 set -Eeuo pipefail
 
-readonly SAPI_VERSION="0.2.0"
+readonly SAPI_VERSION="0.3.0"
 readonly SAPI_REPO="${SAPI_REPO:-sapiensmalti/sapi}"
 readonly SAPI_REF="${SAPI_REF:-main}"
 readonly IMAGE_REPOSITORY="sapi"
@@ -83,11 +83,17 @@ sapi $SAPI_VERSION — the pi coding agent, isolated in Docker, scoped to this d
 Usage:
   sapi [--safer|--no-safer] [NAME]
                      Start (or resume) an agent in the current directory
+  sapi run [--json] [--timeout S] TASK
+                     Headless: one task, final message on stdout, agent's exit code ('-' reads TASK from stdin)
   sapi backup        Back up this directory now (what --safer does before every start)
   sapi backups       List this directory's backups
-  sapi restore FILE [DEST]
+  sapi diff [BACKUP] [--full]
+                     What changed since the latest (or given) backup: A/M/D per path; --full for a unified diff
+  sapi restore FILE|latest [DEST]
                      Restore a backup into DEST (default: a new sibling directory; never in place)
-  sapi config [show | set KEY VALUE | path]
+  sapi restore FILE|latest --files PATH...
+                     Put back only the named paths, in place
+  sapi config [show | set KEY VALUE | keys | path]
                      Show or change persistent settings
   sapi ls            List sapi containers
   sapi rm [--all]    Remove this directory's containers (or all of them)
@@ -111,10 +117,11 @@ Environment:
   SAPI_BACKUP_DIR     Where backups go (default: ~/.local/share/sapi/backups); must be outside the directory
   SAPI_BACKUP_KEEP    Backups to keep per directory (default: 10; 0 = keep all)
 
-Config file ($CONFIG_FILE), 'key = value', same keys in lower case:
-  safer = true
-  backup_dir = /path
-  backup_keep = 10
+  SAPI_CPUS / SAPI_MEMORY_MIB / SAPI_PIDS
+                      Resource ceilings for the agent container (default: unlimited / unlimited / 4096)
+
+Config file ($CONFIG_FILE), 'key = value' ('sapi config keys' lists them):
+$(setting_help)
 Precedence: flag > environment > config file > default.
 
 Inside the agent:  detach with Ctrl-P, Ctrl-Q.  Reattach with 'sapi'.
@@ -182,27 +189,52 @@ readonly IMAGE
 # sourced. An unknown key or an invalid value refuses to start: a safety
 # setting that is silently ignored because of a typo is worse than none.
 # ---------------------------------------------------------------------------
-CFG_safer=""; CFG_backup_dir=""; CFG_backup_keep=""
-
-parse_bool() {  # $1 value, $2 what (for errors) -> prints 1 or 0
-    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
-        1|true|yes|on)  printf 1 ;;
-        0|false|no|off) printf 0 ;;
-        *) die "$2 must be true or false, got '$1'" ;;
-    esac
-}
-parse_uint() { [[ "$1" =~ ^[0-9]+$ ]] || die "$2 must be a non-negative integer, got '$1'"; printf '%s' "$1"; }
-parse_abs_path() { [[ "$1" == /* ]] || die "$2 must be an absolute path, got '$1'"; printf '%s' "$1"; }
-
-validate_setting() {  # $1 key, $2 value -> prints normalised value
+# Settings are declared once, here. Each has a type, an environment variable
+# and a default; the same table drives parsing, precedence and `sapi config`.
+readonly SETTING_KEYS="safer backup_dir backup_keep cpus memory_mib pids"
+setting_spec() {  # $1 key -> "type env default"
     case "$1" in
-        safer)       parse_bool "$2" "$1" ;;
-        backup_dir)  parse_abs_path "$2" "$1" ;;
-        backup_keep) parse_uint "$2" "$1" ;;
-        *) die "unknown setting '$1' (known: safer, backup_dir, backup_keep)" ;;
+        safer)       printf 'bool SAPI_SAFER false' ;;
+        backup_dir)  printf 'path SAPI_BACKUP_DIR %s' "${XDG_DATA_HOME:-$HOME/.local/share}/sapi/backups" ;;
+        backup_keep) printf 'uint SAPI_BACKUP_KEEP 10' ;;
+        cpus)        printf 'number SAPI_CPUS 0' ;;
+        memory_mib)  printf 'uint SAPI_MEMORY_MIB 0' ;;
+        pids)        printf 'uint SAPI_PIDS 4096' ;;
+        *) return 1 ;;
+    esac
+}
+setting_help() {
+    cat <<'HELP'
+  safer        bool    back up the directory before every start; abort if that fails
+  backup_dir   path    where backups go (absolute; must be outside the directory)
+  backup_keep  uint    backups kept per directory (0 = keep all)
+  cpus         number  CPU ceiling for the agent container (0 = unlimited)
+  memory_mib   uint    memory ceiling in MiB (0 = unlimited)
+  pids         uint    process ceiling (0 = unlimited)
+HELP
+}
+
+# Validate a value for a key; print the normalised value or die.
+validate_setting() {  # $1 key, $2 value, $3 where (for messages)
+    local spec type; spec="$(setting_spec "$1")" || die "unknown setting '$1' (known: $SETTING_KEYS)"
+    type="${spec%% *}"
+    local v="$2" where="${3:-$1}"
+    case "$type" in
+        bool)
+            case "$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')" in
+                1|true|yes|on)  printf true ;;
+                0|false|no|off) printf false ;;
+                *) die "$where must be true or false, got '$v'" ;;
+            esac ;;
+        uint)   [[ "$v" =~ ^[0-9]+$ ]] || die "$where must be a non-negative integer, got '$v'"; printf '%s' "$v" ;;
+        number) [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$where must be a non-negative number, got '$v'"; printf '%s' "$v" ;;
+        path)   [[ "$v" == /* ]] || die "$where must be an absolute path, got '$v'"; printf '%s' "$v" ;;
     esac
 }
 
+# Parse the config file into CFG_<key>. Whitelisted keys, validated values,
+# never sourced. Unknown keys or invalid values refuse to start: a safety
+# setting silently ignored because of a typo is worse than none.
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
     [[ -r "$CONFIG_FILE" ]] || die "cannot read $CONFIG_FILE"
@@ -215,31 +247,36 @@ load_config() {
         [[ "$line" =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] \
             || die "$CONFIG_FILE:$n: expected 'key = value', got '$line'"
         key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
-        value="$(validate_setting "$key" "$value")" || exit 1
-        case "$key" in
-            safer)       CFG_safer="$value" ;;
-            backup_dir)  CFG_backup_dir="$value" ;;
-            backup_keep) CFG_backup_keep="$value" ;;
-        esac
+        value="$(validate_setting "$key" "$value" "$CONFIG_FILE:$n: $key")" || exit 1
+        printf -v "CFG_$key" '%s' "$value"
     done <"$CONFIG_FILE"
 }
 
-# Effective settings. Precedence: flag > environment > config file > default.
+# Effective settings into SET_<key> / SRC_<key>.
+# Precedence: flag > environment > config file > default.
 SAFER_FLAG=""   # set by --safer / --no-safer
+SET_safer=""; SET_backup_dir=""; SET_backup_keep=""; SET_cpus=""; SET_memory_mib=""; SET_pids=""
 resolve_settings() {
     load_config
-    if [[ -n "$SAFER_FLAG" ]]; then SAFER="$SAFER_FLAG"; SAFER_SRC="flag"
-    elif [[ -n "${SAPI_SAFER:-}" ]]; then SAFER="$(parse_bool "$SAPI_SAFER" SAPI_SAFER)"; SAFER_SRC="environment"
-    elif [[ -n "$CFG_safer" ]]; then SAFER="$CFG_safer"; SAFER_SRC="config"
-    else SAFER=0; SAFER_SRC="default"; fi
-
-    if [[ -n "${SAPI_BACKUP_DIR:-}" ]]; then BACKUP_DIR="$(parse_abs_path "$SAPI_BACKUP_DIR" SAPI_BACKUP_DIR)"; BACKUP_DIR_SRC="environment"
-    elif [[ -n "$CFG_backup_dir" ]]; then BACKUP_DIR="$CFG_backup_dir"; BACKUP_DIR_SRC="config"
-    else BACKUP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/sapi/backups"; BACKUP_DIR_SRC="default"; fi
-
-    if [[ -n "${SAPI_BACKUP_KEEP:-}" ]]; then BACKUP_KEEP="$(parse_uint "$SAPI_BACKUP_KEEP" SAPI_BACKUP_KEEP)"; BACKUP_KEEP_SRC="environment"
-    elif [[ -n "$CFG_backup_keep" ]]; then BACKUP_KEEP="$CFG_backup_keep"; BACKUP_KEEP_SRC="config"
-    else BACKUP_KEEP=10; BACKUP_KEEP_SRC="default"; fi
+    local key spec env default cfg_var env_val
+    for key in $SETTING_KEYS; do
+        spec="$(setting_spec "$key")"
+        env="$(printf '%s' "$spec" | awk '{print $2}')"
+        default="${spec#* * }"
+        cfg_var="CFG_$key"
+        env_val="${!env:-}"
+        if [[ "$key" == safer && -n "$SAFER_FLAG" ]]; then
+            printf -v "SET_$key" '%s' "$SAFER_FLAG"; printf -v "SRC_$key" flag
+        elif [[ -n "$env_val" ]]; then
+            printf -v "SET_$key" '%s' "$(validate_setting "$key" "$env_val" "$env")" || exit 1
+            printf -v "SRC_$key" environment
+        elif [[ -n "${!cfg_var:-}" ]]; then
+            printf -v "SET_$key" '%s' "${!cfg_var}"; printf -v "SRC_$key" config
+        else
+            printf -v "SET_$key" '%s' "$default"; printf -v "SRC_$key" default
+        fi
+    done
+    SAFER="$SET_safer"; BACKUP_DIR="$SET_backup_dir"; BACKUP_KEEP="$SET_backup_keep"
 }
 
 cmd_config() {
@@ -247,15 +284,17 @@ cmd_config() {
         show)
             resolve_settings
             printf 'config file  %s%s\n' "$CONFIG_FILE" "$([[ -f "$CONFIG_FILE" ]] || printf ' (absent)')"
-            printf 'safer        %s  (%s)\n' "$([[ "$SAFER" == 1 ]] && printf true || printf false)" "$SAFER_SRC"
-            printf 'backup_dir   %s  (%s)\n' "$BACKUP_DIR" "$BACKUP_DIR_SRC"
-            printf 'backup_keep  %s  (%s)\n' "$BACKUP_KEEP" "$BACKUP_KEEP_SRC" ;;
+            local key v s
+            for key in $SETTING_KEYS; do
+                v="SET_$key"; s="SRC_$key"
+                printf '%-12s %s  (%s)\n' "$key" "${!v}" "${!s}"
+            done ;;
         path) printf '%s\n' "$CONFIG_FILE" ;;
+        keys) setting_help ;;
         set)
             [[ $# -eq 3 ]] || die "usage: sapi config set KEY VALUE"
             local key="$2" value
             value="$(validate_setting "$key" "$3")" || exit 1
-            [[ "$key" == safer ]] && value="$([[ "$value" == 1 ]] && printf true || printf false)"
             load_config  # refuse to edit a file we cannot parse
             local dir tmp; dir="$(dirname "$CONFIG_FILE")"
             (umask 077 && mkdir -p "$dir") || die "cannot create $dir"
@@ -269,7 +308,7 @@ cmd_config() {
             fi
             mv -f "$tmp" "$CONFIG_FILE"
             log "$key = $value  ($CONFIG_FILE)" ;;
-        *) die "usage: sapi config [show | set KEY VALUE | path]" ;;
+        *) die "usage: sapi config [show | set KEY VALUE | keys | path]" ;;
     esac
 }
 
@@ -303,10 +342,12 @@ backup_create() {
     [[ "$have" =~ ^[0-9]+$ ]] || die "backup: cannot determine free space at $root_real"
     (( have > need + 65536 )) || die "backup: not enough space at $root_real (need ~$((need / 1024)) MiB, have $((have / 1024)) MiB)"
 
-    local stamp name final partial n=1
+    local stamp name final partial
+    # Names are UTC stamps and must sort chronologically, so a same-second
+    # collision waits for the next second instead of adding a suffix.
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    while [[ -e "$root/$stamp.tar.gz" ]]; do sleep 1; stamp="$(date -u +%Y%m%dT%H%M%SZ)"; done
     name="$stamp.tar.gz"
-    while [[ -e "$root/$name" ]]; do n=$((n + 1)); name="$stamp-$n.tar.gz"; done
     final="$root/$name"; partial="$root/.$name.partial"
     BACKUP_PARTIAL="$partial"
     trap '[[ -n "${BACKUP_PARTIAL:-}" ]] && rm -f -- "$BACKUP_PARTIAL"' EXIT
@@ -362,7 +403,8 @@ cmd_backups() {
 
 cmd_restore() {
     local file="${1:-}" dest="${2:-}"
-    [[ -n "$file" ]] || die "usage: sapi restore FILE [DEST]"
+    [[ -n "$file" ]] || die "usage: sapi restore FILE [DEST] | sapi restore FILE --files PATH..."
+    [[ "$file" == latest ]] && { resolve_settings; file="$(latest_backup)" || die "restore: no backups for $WORKSPACE"; }
     [[ -f "$file" ]] || die "restore: no such file: $file"
     if [[ -f "$file.sha256" ]]; then
         local want have
@@ -372,6 +414,25 @@ cmd_restore() {
         log "restore: warning: no checksum sidecar for $file"
     fi
     tar -tzf "$file" >/dev/null 2>&1 || die "restore: $file is not a readable tar.gz"
+
+    if [[ "$dest" == --files ]]; then
+        # Selective, in-place restore: the one operation that writes into the
+        # workspace, and only the paths named, explicitly, by the user.
+        shift 2
+        [[ $# -gt 0 ]] || die "restore: --files needs at least one path"
+        local top p members=()
+        top="$(tar -tzf "$file" | head -n 1)"; top="${top%%/*}"
+        for p in "$@"; do
+            [[ "$p" != /* && "$p" != *..* ]] || die "restore: paths must be relative and inside the directory: $p"
+            p="${p%/}"
+            tar -tzf "$file" -- "$top/$p" >/dev/null 2>&1 || die "restore: '$p' is not in the backup"
+            members+=("$top/$p")
+        done
+        tar -xzf "$file" -C "$WORKSPACE" --strip-components=1 -- "${members[@]}" || die "restore: extraction failed"
+        for p in "$@"; do printf 'restored  %s\n' "${p%/}"; done
+        return 0
+    fi
+
     [[ -n "$dest" ]] || dest="$WORKSPACE.restored-$(date -u +%Y%m%dT%H%M%SZ)"
     if [[ -e "$dest" ]]; then
         [[ -d "$dest" ]] || die "restore: $dest exists and is not a directory"
@@ -438,6 +499,40 @@ cmd_upgrade() {
     curl -fsSL "$url" | SAPI_INSTALL_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" bash
 }
 
+# The container specification shared by `sapi` and `sapi run`: one place for
+# mounts, environment, hardening and resource ceilings. Prints one argument
+# per line (read back into an array by the callers).
+container_args() {  # $1 container name, $2 sessions volume
+    local name="$1" sessions="$2"
+    local -a a=(--init --name "$name" --hostname sapi
+        --label "$LABEL.managed=true" --label "$LABEL.version=$SAPI_VERSION"
+        --label "$LABEL.workspace=$WORKSPACE" --label "$LABEL.workspace-hash=$WORKSPACE_HASH"
+        --label "$LABEL.model=$MODEL" --label "$LABEL.user=$UID_:$GID_" --label "$LABEL.auto-update=$AUTO_UPDATE"
+        --volume "$WORKSPACE:/workspace"
+        --mount "type=volume,source=$CONFIG_VOLUME,target=/pi-config"
+        --mount "type=volume,source=$sessions,target=/pi-sessions"
+        --workdir /workspace
+        --env PI_CODING_AGENT_DIR=/pi-config --env PI_CODING_AGENT_SESSION_DIR=/pi-sessions
+        --env GIT_CONFIG_GLOBAL=/pi-config/gitconfig
+        --env "SAPI_AUTO_UPDATE=$AUTO_UPDATE" --env "SAPI_UID=$UID_" --env "SAPI_GID=$GID_"
+        --security-opt no-new-privileges --cap-drop ALL
+        --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER
+        --cap-add SETUID --cap-add SETGID --cap-add SETPCAP)
+    # Resource ceilings (0 = unlimited).
+    [[ "$SET_cpus" != 0 && "$SET_cpus" != 0.0 ]] && a+=(--cpus "$SET_cpus")
+    [[ "$SET_memory_mib" != 0 ]] && a+=(--memory "${SET_memory_mib}m")
+    [[ "$SET_pids" != 0 ]] && a+=(--pids-limit "$SET_pids")
+    local var
+    for var in ${SAPI_ENV:-}; do
+        [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "SAPI_ENV: invalid variable name '$var'"
+        [[ -n "${!var:-}" ]] || log "warning: SAPI_ENV variable $var is unset"
+        a+=(--env "$var")
+    done
+    # shellcheck disable=SC2206
+    [[ -n "${SAPI_DOCKER_ARGS:-}" ]] && a+=($SAPI_DOCKER_ARGS)
+    printf '%s\n' "${a[@]}"
+}
+
 attach() {
     local name="$1"
     printf '\n  container  %s\n  workspace  %s\n  config     %s\n  sessions   %s\n  user       %s\n' \
@@ -453,7 +548,7 @@ cmd_start() {
     cmd_build
     # Snapshot the directory right before the agent gets access to it.
     BACKUP_PATH=""
-    [[ "$SAFER" == 1 ]] && backup_create
+    [[ "$SAFER" == true ]] && backup_create
     local image_id; image_id="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
 
     local base
@@ -498,42 +593,12 @@ cmd_start() {
 
     local pi_args=(--continue)
     [[ -n "$MODEL" ]] && pi_args+=(--model "$MODEL")
-    local extra=() var
-    for var in ${SAPI_ENV:-}; do
-        [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "SAPI_ENV: invalid variable name '$var'"
-        [[ -n "${!var:-}" ]] || log "warning: SAPI_ENV variable $var is unset"
-        extra+=(--env "$var")
-    done
-    # shellcheck disable=SC2206
-    [[ -n "${SAPI_DOCKER_ARGS:-}" ]] && extra+=($SAPI_DOCKER_ARGS)
+    local -a args=()
+    while IFS= read -r line; do args+=("$line"); done < <(container_args "$name" "$sessions")
 
-    docker create \
-        --interactive --tty --init \
-        --name "$name" \
-        --hostname sapi \
-        --label "$LABEL.managed=true" \
-        --label "$LABEL.version=$SAPI_VERSION" \
-        --label "$LABEL.workspace=$WORKSPACE" \
-        --label "$LABEL.workspace-hash=$WORKSPACE_HASH" \
-        --label "$LABEL.model=$MODEL" \
-        --label "$LABEL.user=$UID_:$GID_" \
-        --label "$LABEL.auto-update=$AUTO_UPDATE" \
+    docker create --interactive --tty \
         --label "$LABEL.sessions-volume=$sessions" \
-        --volume "$WORKSPACE:/workspace" \
-        --mount "type=volume,source=$CONFIG_VOLUME,target=/pi-config" \
-        --mount "type=volume,source=$sessions,target=/pi-sessions" \
-        --workdir /workspace \
-        --env PI_CODING_AGENT_DIR=/pi-config \
-        --env PI_CODING_AGENT_SESSION_DIR=/pi-sessions \
-        --env GIT_CONFIG_GLOBAL=/pi-config/gitconfig \
-        --env "SAPI_AUTO_UPDATE=$AUTO_UPDATE" \
-        --env "SAPI_UID=$UID_" \
-        --env "SAPI_GID=$GID_" \
-        --security-opt no-new-privileges \
-        --cap-drop ALL \
-        --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER \
-        --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
-        ${extra[@]+"${extra[@]}"} \
+        "${args[@]}" \
         "$IMAGE" "${pi_args[@]}" >/dev/null \
         || die "could not create container $name"
 
@@ -541,10 +606,144 @@ cmd_start() {
 }
 
 # ---------------------------------------------------------------------------
+# Headless: sapi run TASK
+#
+# One ephemeral container, one task, the agent's final message on stdout,
+# the agent's exit code. Progress and diagnostics on stderr. With safer mode
+# the run is bracketed by a backup before and a run manifest after, so a cron
+# job leaves behind: what it was asked, what the tree looked like before, what
+# it answered, how it exited, and (via `sapi diff`) exactly what it changed.
+# ---------------------------------------------------------------------------
+cmd_run() {
+    local json=0 timeout=0 task_parts=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            --timeout) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--timeout needs seconds"; timeout="$2"; shift 2 ;;
+            --timeout=*) timeout="${1#*=}"; [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout needs seconds"; shift ;;
+            --) shift; task_parts+=("$@"); break ;;
+            -) task_parts+=("$(cat)"); shift ;;
+            -*) die "run: unknown option $1 (options: --json, --timeout SECONDS)" ;;
+            *) task_parts+=("$1"); shift ;;
+        esac
+    done
+    local task="${task_parts[*]:-}"
+    [[ -n "${task//[[:space:]]/}" ]] || die "usage: sapi run [--json] [--timeout SECONDS] TASK  (or '-' to read TASK from stdin)"
+
+    resolve_settings
+    cmd_build
+    BACKUP_PATH=""
+    [[ "$SAFER" == true ]] && backup_create
+
+    local ws; ws="$(sanitize "$(basename "$WORKSPACE")")"; ws="${ws:-workspace}"
+    local base="sapi-${ws:0:36}-${WORKSPACE_HASH:0:8}"
+    local sessions="$base-runs-sessions"
+    local name; name="$base-run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    docker volume create "$CONFIG_VOLUME" >/dev/null
+    docker volume create "$sessions" >/dev/null
+
+    local pi_args=(-p --no-approve)
+    [[ "$json" == 1 ]] && pi_args+=(--mode json)
+    [[ -n "$MODEL" ]] && pi_args+=(--model "$MODEL")
+    pi_args+=(--name "sapi run $(date -u +%Y-%m-%dT%H:%M:%SZ)" -- "$task")
+
+    local -a args=()
+    while IFS= read -r line; do args+=("$line"); done < <(container_args "$name" "$sessions")
+
+    local started rc=0
+    started="$(date +%s)"
+    log "run: $name"
+    # docker run in the background so a timeout can stop it cleanly; stdout
+    # flows straight through to ours.
+    docker run --rm --label "$LABEL.run=true" "${args[@]}" "$IMAGE" "${pi_args[@]}" &
+    local dpid=$!
+    if (( timeout > 0 )); then
+        ( sleep "$timeout"; docker stop --time 10 "$name" >/dev/null 2>&1 ) &
+        local tpid=$!
+        wait "$dpid" || rc=$?
+        kill "$tpid" 2>/dev/null || true
+        if (( $(date +%s) - started >= timeout )) && (( rc != 0 )); then rc=124; log "run: timed out after ${timeout}s"; fi
+    else
+        wait "$dpid" || rc=$?
+    fi
+
+    if [[ -n "$BACKUP_PATH" ]]; then
+        (umask 077; printf 'task = %s\ncontainer = %s\nstarted_utc = %s\nfinished_utc = %s\nexit_code = %s\nmodel = %s\nsapi_version = %s\n' \
+            "$(printf '%s' "$task" | head -c 2000 | tr '\n' ' ')" "$name" "$(date -u -r "$started" +%Y%m%dT%H%M%SZ 2>/dev/null || date -u -d "@$started" +%Y%m%dT%H%M%SZ)" \
+            "$(date -u +%Y%m%dT%H%M%SZ)" "$rc" "${MODEL:-default}" "$SAPI_VERSION" >"$BACKUP_PATH.run")
+        log "run: exit $rc · backup $BACKUP_PATH · see 'sapi diff' for changes"
+    else
+        log "run: exit $rc"
+    fi
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# sapi diff [BACKUP] [--full]: what changed since the backup
+# ---------------------------------------------------------------------------
+latest_backup() {
+    local root; root="$(backup_root)"
+    [[ -d "$root" ]] || return 1
+    find "$root" -maxdepth 1 -name '*.tar.gz' -type f | sort | tail -n 1
+}
+
+cmd_diff() {
+    local file="" full=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --full) full=1 ;;
+            -*) die "diff: unknown option $arg" ;;
+            *) file="$arg" ;;
+        esac
+    done
+    resolve_settings
+    if [[ -z "$file" ]]; then
+        file="$(latest_backup)" || die "diff: no backups for $WORKSPACE (take one with 'sapi backup' or run with --safer)"
+    fi
+    [[ -f "$file" ]] || die "diff: no such backup: $file"
+    if [[ -f "$file.sha256" ]]; then
+        [[ "$(awk '{print $1}' "$file.sha256")" == "$(sha256 <"$file")" ]] || die "diff: checksum mismatch for $file"
+    fi
+    DIFF_TMP="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/sapi-diff.XXXXXX")"
+    trap 'rm -rf -- "${DIFF_TMP:-}"' EXIT
+    local tmp="$DIFF_TMP"
+    mkdir -p "$tmp/before"
+    tar -xzf "$file" -C "$tmp/before" --strip-components=1 || die "diff: cannot extract $file"
+
+    local added=0 deleted=0 modified=0 out
+    # diff -rq is portable (GNU and BSD). Exit 1 = differences, 2 = trouble.
+    local rc=0
+    out="$(cd "$tmp" && diff -rq before "$WORKSPACE" 2>&1)" || rc=$?
+    (( rc <= 1 )) || die "diff: diff failed: $out"
+    local line path
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        case "$line" in
+            "Only in before"*)
+                path="${line#Only in before}"; path="${path#/}"; path="${path/: //}"; path="${path#/}"
+                printf 'D  %s\n' "$path"; deleted=$((deleted + 1)) ;;
+            "Only in $WORKSPACE"*)
+                path="${line#Only in "$WORKSPACE"}"; path="${path#/}"; path="${path/: //}"; path="${path#/}"
+                printf 'A  %s\n' "$path"; added=$((added + 1)) ;;
+            Files*differ)
+                path="${line#Files before/}"; path="${path%% and *}"
+                printf 'M  %s\n' "$path"; modified=$((modified + 1)) ;;
+            *) printf '?  %s\n' "$line" ;;
+        esac
+    done <<<"$out"
+    if (( full == 1 )); then
+        printf '\n'
+        (cd "$tmp" && diff -ruN before "$WORKSPACE" 2>/dev/null | sed -e "s#^--- before/#--- backup/#" -e "s#^+++ $WORKSPACE/#+++ now/#") || true
+    fi
+    log "diff: $added added, $modified modified, $deleted deleted · vs $(basename "$file")$( [[ -f "$file.run" ]] && printf ' · run exit %s' "$(awk -F' = ' '$1 == "exit_code" {print $2}' "$file.run")")"
+    (( added + modified + deleted == 0 ))
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 while [[ "${1:-}" == --safer || "${1:-}" == --no-safer ]]; do
-    [[ "$1" == --safer ]] && SAFER_FLAG=1 || SAFER_FLAG=0
+    [[ "$1" == --safer ]] && SAFER_FLAG=true || SAFER_FLAG=false
     shift
 done
 case "${1:-}" in
@@ -555,6 +754,8 @@ case "${1:-}" in
             -V|--version) printf '%s\n' "$SAPI_VERSION" ;;
             *) die "unknown option: $1 (see sapi help)" ;;
         esac ;;
+    run)        shift; cmd_run "$@" ;;
+    diff)       shift; cmd_diff "$@" ;;
     backup)     cmd_backup ;;
     backups)    cmd_backups ;;
     restore)    shift; cmd_restore "$@" ;;

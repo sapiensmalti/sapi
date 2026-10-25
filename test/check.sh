@@ -88,6 +88,50 @@ printf '#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted"
 check "insufficient space aborts"    bash -c "cd $proj && ! PATH=$shim:\$PATH $S backup"
 check "prunes to backup_keep"        bash -c "cd $proj && for i in 1 2 3 4; do sleep 1; SAPI_BACKUP_KEEP=2 $S backup >/dev/null 2>&1; done; [[ \$($S backups | wc -l) == 2 ]] && [[ \$(ls '$(dirname "$b")' | wc -l) == 6 ]]"
 check "backup_keep=0 keeps all"      bash -c "cd $proj && SAPI_BACKUP_KEEP=0 $S backup >/dev/null 2>&1 && [[ \$($S backups | wc -l) == 3 ]]"
+
+echo "diff / selective restore"
+rm -rf "$HOME/.local/share/sapi"; echo hello >"$proj/a.txt"; echo keep >"$proj/c.txt"
+(cd "$proj" && "$S" backup >/dev/null 2>&1)
+check "no changes → exit 0"            bash -c "cd $proj && $S diff 2>/dev/null"
+echo changed >"$proj/a.txt"; rm "$proj/c.txt"; echo new >"$proj/sub/n.txt"; mkdir -p "$proj/d"; echo x >"$proj/d/e.txt"
+out="$(cd "$proj" && "$S" diff 2>/dev/null)" && bad "diff exits 1 when there are changes" || ok "diff exits 1 when there are changes"
+check "diff marks M"                   grep -qx "M  a.txt" <<<"$out"
+check "diff marks D"                   grep -qx "D  c.txt" <<<"$out"
+check "diff marks A (nested)"          grep -qx "A  sub/n.txt" <<<"$out"
+check "diff marks A (directory)"       grep -qx "A  d" <<<"$out"
+check "diff --full shows hunks"        bash -c "cd $proj && $S diff --full 2>/dev/null | grep -q '^+changed'"
+check "diff verifies the checksum"     bash -c "b=\$(ls $HOME/.local/share/sapi/backups/*/*.tar.gz); printf x >> \$b; ! $S diff 2>/dev/null; truncate -s -1 \$b"
+check "restore --files puts back a deleted file" bash -c "cd $proj && $S restore latest --files c.txt >/dev/null && [[ \$(cat c.txt) == keep ]]"
+check "restore --files reverts a modified file" bash -c "cd $proj && $S restore latest --files a.txt >/dev/null && [[ \$(cat a.txt) == hello ]]"
+check "restore --files leaves other changes"    bash -c "cd $proj && [[ -f sub/n.txt && -f d/e.txt ]]"
+check "restore --files refuses .. and absolute"  bash -c "cd $proj && ! $S restore latest --files ../x && ! $S restore latest --files /etc"
+check "restore --files refuses unknown path"     bash -c "cd $proj && ! $S restore latest --files nope"
+
+echo "run (docker shim)"
+rshim="$(mktemp -d)"
+cat >"$rshim/docker" <<RS
+#!/usr/bin/env bash
+case "\$1" in
+  info|image) exit 0 ;;
+  volume) echo v ;;
+  stop) [[ -f $rshim/pid ]] && kill "\$(cat $rshim/pid)" 2>/dev/null; exit 0 ;;
+  run) task="\${*: -1}"; printf '%s\\n' "\$*" >$rshim/argv
+       case "\$task" in slow*) echo \$\$ >$rshim/pid; exec sleep 30 ;; fail*) echo no; exit 7 ;; *) echo "Answer: \$task" ;; esac ;;
+  *) exit 1 ;;
+esac
+RS
+chmod +x "$rshim/docker"
+check "run prints the final message"   bash -c "cd $proj && [[ \$(PATH=$rshim:\$PATH $S run 'say hi' 2>/dev/null) == 'Answer: say hi' ]]"
+check "run passes -p --no-approve and hardening" bash -c "tr ' ' '\\n' <$rshim/argv | grep -qx -- -p && grep -q -- '--no-approve' $rshim/argv && grep -q -- '--cap-drop ALL' $rshim/argv && grep -q -- '--rm' $rshim/argv"
+check "run applies resource ceilings" bash -c "cd $proj && SAPI_CPUS=1.5 SAPI_MEMORY_MIB=2048 SAPI_PIDS=99 PATH=$rshim:\$PATH $S run x >/dev/null 2>&1 && grep -q -- '--cpus 1.5 --memory 2048m --pids-limit 99' $rshim/argv"
+check "run omits ceilings when 0"     bash -c "cd $proj && SAPI_PIDS=0 PATH=$rshim:\$PATH $S run x >/dev/null 2>&1 && ! grep -q -- '--pids-limit' $rshim/argv && ! grep -q -- '--cpus' $rshim/argv"
+check "run propagates the exit code"  bash -c "cd $proj; PATH=$rshim:\$PATH $S run fail >/dev/null 2>&1; [[ \$? == 7 ]]"
+check "run reads the task from stdin" bash -c "cd $proj && [[ \$(echo piped | PATH=$rshim:\$PATH $S run - 2>/dev/null) == 'Answer: piped' ]]"
+check "run --json passes --mode json" bash -c "cd $proj && PATH=$rshim:\$PATH $S run --json x >/dev/null 2>&1 && grep -q -- '--mode json' $rshim/argv"
+check "run --timeout stops and exits 124" bash -c "cd $proj; PATH=$rshim:\$PATH $S run --timeout 1 slow >/dev/null 2>&1; [[ \$? == 124 ]]"
+check "run refuses an empty task"     bash -c "cd $proj && ! $S run '  ' 2>/dev/null"
+check "--safer run writes a run manifest next to the backup" bash -c "cd $proj && PATH=$rshim:\$PATH $S --safer run 'do it' >/dev/null 2>&1 && m=\$(ls $HOME/.local/share/sapi/backups/*/*.run | tail -1) && grep -qx 'task = do it' \$m && grep -qx 'exit_code = 0' \$m"
+rm -rf "$rshim"
 rm -rf "$HOME" "$shim"; HOME="$REAL_HOME"; unset SAPI_CONFIG_FILE
 
 echo "hygiene"
