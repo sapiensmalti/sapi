@@ -124,8 +124,10 @@ docker exec "$EGRESS_CONTAINER" test -f /run/egress/ready && ok "sidecar becomes
 [[ "$(docker exec -u 0 "$EGRESS_CONTAINER" iptables -S | grep -c -- '-A OUTPUT -m owner --uid-owner 65532 -j ACCEPT')" == 1 ]] \
     && ok "firewall restart does not accumulate duplicate rules" || bad "firewall rules duplicated on restart"
 agent() { local ep="$1"; shift; docker run --rm --network container:"$EGRESS_CONTAINER" --cap-drop ALL --security-opt no-new-privileges --entrypoint "$ep" "$SAPI_IMAGE" "$@"; }
-# Allowed: HTTPS by SNI, relayed by name.
-agent curl -fsS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/ 2>/dev/null | grep -q '^[23]' && ok "allowed https host reachable" || bad "allowed https host unreachable"
+# Allowed: HTTPS by SNI, relayed by name. Any HTTP status, including GitHub's
+# anonymous rate-limit 403, proves an upstream response; the sidecar cannot
+# synthesize a TLS response. Do not confuse HTTP access control with reachability.
+agent curl -sS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/ 2>/dev/null | grep -qE '^[1-5][0-9][0-9]$' && ok "allowed https host reachable" || bad "allowed https host unreachable"
 if (( fail > 0 )); then
     echo "--- diagnostics"
     echo "curl:"; agent curl -sS -m 10 -v https://api.github.com/ 2>&1 | tail -n 8 || true
