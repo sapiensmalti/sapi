@@ -12,7 +12,10 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+
+static INSTANCE: AtomicUsize = AtomicUsize::new(0);
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,7 +58,8 @@ struct Proxy {
 impl Proxy {
     fn start(allow: &str, upstream: SocketAddr) -> Self {
         let (dns, tls, http) = (free_port(), free_port(), free_port());
-        let ready = std::env::temp_dir().join(format!("egress-ready-{}", std::process::id()));
+        let n = INSTANCE.fetch_add(1, Ordering::SeqCst);
+        let ready = std::env::temp_dir().join(format!("egress-ready-{}-{n}", std::process::id()));
         let _ = std::fs::remove_file(&ready);
         let mut child = Command::new(env!("CARGO_BIN_EXE_sapi-egress"))
             .args([
