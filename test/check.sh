@@ -2,6 +2,7 @@
 # Portable Linux/macOS lint and unit checks. No Docker required.
 # The linter is optional locally and mandatory in CI.
 set -Eeuo pipefail
+[[ "${DEBUG:-0}" == 1 ]] && set -x
 cd "$(dirname "$0")/.."
 
 pass=0; fail=0

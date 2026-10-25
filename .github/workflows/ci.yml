@@ -23,6 +23,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install shellcheck
       - run: test/check.sh
+        env:
+          DEBUG: ${{ runner.os == 'macOS' && 1 || 0 }}
 
   egress:
     name: egress (fmt, clippy, tests, image)

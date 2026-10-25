@@ -2,12 +2,13 @@
 # `cargo deny check` runs in CI on every change.
 
 [advisories]
-vulnerability = "deny"
+version = 2
+# v2 denies vulnerabilities, unsoundness, and notices by default.
 unmaintained = "workspace"
 yanked = "deny"
-notice = "warn"
 
 [licenses]
+version = 2
 # Dependencies are all standard Rust permissive licenses. Add no copyleft or
 # unknown license without an explicit review.
 allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "Unicode-3.0"]
