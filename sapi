@@ -5,7 +5,7 @@
 # One file. No dependencies beyond bash, docker and coreutils.
 set -Eeuo pipefail
 
-readonly SAPI_VERSION="0.3.0"
+readonly SAPI_VERSION="0.4.0"
 readonly SAPI_REPO="${SAPI_REPO:-sapiensmalti/sapi}"
 readonly SAPI_REF="${SAPI_REF:-main}"
 readonly IMAGE_REPOSITORY="sapi"
@@ -119,6 +119,9 @@ Environment:
 
   SAPI_CPUS / SAPI_MEMORY_MIB / SAPI_PIDS
                       Resource ceilings for the agent container (default: unlimited / unlimited / 4096)
+  SAPI_PACKAGES       Extra Debian packages baked into the image, e.g. "golang make"
+  SAPI_DOCKERFILE_EXTRA
+                      Dockerfile fragment appended to the image (default: ~/.config/sapi/Dockerfile.extra)
 
 Config file ($CONFIG_FILE), 'key = value' ('sapi config keys' lists them):
 $(setting_help)
@@ -178,9 +181,29 @@ readonly OS WORKSPACE WORKSPACE_HASH PI_VERSION MODEL REBUILD AUTO_UPDATE UID_ G
 [[ "$AUTO_UPDATE" == 0 || "$AUTO_UPDATE" == 1 ]] || die "SAPI_AUTO_UPDATE must be 0 or 1"
 [[ "$UID_$GID_" =~ ^[0-9]+$ ]] || die "SAPI_UID and SAPI_GID must be integers"
 
-# The image tag is a hash of everything that goes into it.
-IMAGE="${SAPI_IMAGE:-$IMAGE_REPOSITORY:$(printf '%s\n%s\n' "$PI_VERSION" "$DOCKERFILE" | sha256 | cut -c1-12)}"
-readonly IMAGE
+# The effective Dockerfile is the embedded one plus the user's toolchain
+# customisation (see `packages` and `dockerfile_extra`). The image tag is a
+# hash of everything that goes into it, so any change yields a new image and
+# an unchanged definition is never rebuilt. Resolved after settings are read.
+IMAGE=""; EFFECTIVE_DOCKERFILE=""
+resolve_image() {
+    [[ -n "$IMAGE" ]] && return 0
+    EFFECTIVE_DOCKERFILE="$DOCKERFILE"
+    if [[ -n "${SET_packages:-}" ]]; then
+        EFFECTIVE_DOCKERFILE+="
+# --- sapi: packages (from \`sapi config\` / SAPI_PACKAGES) ---
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends $SET_packages \\
+    && rm -rf /var/lib/apt/lists/*"
+    fi
+    if [[ -n "${SET_dockerfile_extra:-}" && -f "$SET_dockerfile_extra" ]]; then
+        [[ -r "$SET_dockerfile_extra" ]] || die "cannot read $SET_dockerfile_extra"
+        EFFECTIVE_DOCKERFILE+="
+# --- sapi: $SET_dockerfile_extra ---
+$(cat "$SET_dockerfile_extra")"
+    fi
+    IMAGE="${SAPI_IMAGE:-$IMAGE_REPOSITORY:$(printf '%s\n%s\n' "$PI_VERSION" "$EFFECTIVE_DOCKERFILE" | sha256 | cut -c1-12)}"
+}
 
 # ---------------------------------------------------------------------------
 # Config file
@@ -191,7 +214,7 @@ readonly IMAGE
 # ---------------------------------------------------------------------------
 # Settings are declared once, here. Each has a type, an environment variable
 # and a default; the same table drives parsing, precedence and `sapi config`.
-readonly SETTING_KEYS="safer backup_dir backup_keep cpus memory_mib pids"
+readonly SETTING_KEYS="safer backup_dir backup_keep cpus memory_mib pids packages dockerfile_extra"
 setting_spec() {  # $1 key -> "type env default"
     case "$1" in
         safer)       printf 'bool SAPI_SAFER false' ;;
@@ -200,6 +223,8 @@ setting_spec() {  # $1 key -> "type env default"
         cpus)        printf 'number SAPI_CPUS 0' ;;
         memory_mib)  printf 'uint SAPI_MEMORY_MIB 0' ;;
         pids)        printf 'uint SAPI_PIDS 4096' ;;
+        packages)    printf 'packages SAPI_PACKAGES ' ;;
+        dockerfile_extra) printf 'path SAPI_DOCKERFILE_EXTRA %s' "$(dirname "$CONFIG_FILE")/Dockerfile.extra" ;;
         *) return 1 ;;
     esac
 }
@@ -211,6 +236,9 @@ setting_help() {
   cpus         number  CPU ceiling for the agent container (0 = unlimited)
   memory_mib   uint    memory ceiling in MiB (0 = unlimited)
   pids         uint    process ceiling (0 = unlimited)
+  packages     list    extra Debian packages baked into the image, e.g. "golang make postgresql-client"
+  dockerfile_extra path  Dockerfile fragment appended to the image when the file exists
+                       (default: ~/.config/sapi/Dockerfile.extra; user-level only, never from a project)
 HELP
 }
 
@@ -229,6 +257,14 @@ validate_setting() {  # $1 key, $2 value, $3 where (for messages)
         uint)   [[ "$v" =~ ^[0-9]+$ ]] || die "$where must be a non-negative integer, got '$v'"; printf '%s' "$v" ;;
         number) [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$where must be a non-negative number, got '$v'"; printf '%s' "$v" ;;
         path)   [[ "$v" == /* ]] || die "$where must be an absolute path, got '$v'"; printf '%s' "$v" ;;
+        packages)
+            # Debian package names, whitespace or comma separated; normalised to one space.
+            local p out=""
+            for p in $(printf '%s' "$v" | tr ',' ' '); do
+                [[ "$p" =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || die "$where: '$p' is not a valid Debian package name"
+                out+="${out:+ }$p"
+            done
+            printf '%s' "$out" ;;
     esac
 }
 
@@ -255,7 +291,7 @@ load_config() {
 # Effective settings into SET_<key> / SRC_<key>.
 # Precedence: flag > environment > config file > default.
 SAFER_FLAG=""   # set by --safer / --no-safer
-SET_safer=""; SET_backup_dir=""; SET_backup_keep=""; SET_cpus=""; SET_memory_mib=""; SET_pids=""
+SET_safer=""; SET_backup_dir=""; SET_backup_keep=""; SET_cpus=""; SET_memory_mib=""; SET_pids=""; SET_packages=""; SET_dockerfile_extra=""
 resolve_settings() {
     load_config
     local key spec env default cfg_var env_val
@@ -449,16 +485,18 @@ cmd_restore() {
 # Commands
 # ---------------------------------------------------------------------------
 cmd_build() {
-    require_docker
+    resolve_settings; resolve_image; require_docker
     if [[ "$REBUILD" == 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
         local opts=(--tag "$IMAGE" --build-arg "PI_VERSION=$PI_VERSION")
         [[ "$REBUILD" == 1 ]] && opts+=(--no-cache --pull)
-        log "building $IMAGE ..."
+        log "building $IMAGE ...${SET_packages:+ (packages: $SET_packages)}"
         local ctx; ctx="$(mktemp -d)"
-        printf '%s\n' "$DOCKERFILE" | DOCKER_BUILDKIT=1 docker build "${opts[@]}" -f - "$ctx"
+        printf '%s\n' "$EFFECTIVE_DOCKERFILE" | DOCKER_BUILDKIT=1 docker build "${opts[@]}" -f - "$ctx"
         rmdir "$ctx"
     fi
 }
+
+cmd_dockerfile() { resolve_settings; resolve_image; printf '%s\n' "$EFFECTIVE_DOCKERFILE"; }
 
 cmd_ls() {
     require_docker
@@ -762,7 +800,7 @@ case "${1:-}" in
     config)     shift; cmd_config "$@" ;;
     help)       usage ;;
     version)    printf '%s\n' "$SAPI_VERSION" ;;
-    dockerfile) printf '%s\n' "$DOCKERFILE" ;;
+    dockerfile) cmd_dockerfile ;;
     build)      cmd_build ;;
     ls)         cmd_ls ;;
     rm)         cmd_rm "${2:-}" ;;

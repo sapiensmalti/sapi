@@ -62,6 +62,12 @@ echo "cli (docker-backed)"
 sapi_bin="$PWD/sapi"
 (cd "$ws" && "$sapi_bin" rm >/dev/null 2>&1) && ok "sapi rm (nothing to remove)" || bad "sapi rm"
 
+echo "toolchain (real build)"
+pkg_img="sapi:smoke-pkg"
+(cd "$(mktemp -d)" && SAPI_IMAGE="$pkg_img" SAPI_PACKAGES=file "$sapi_bin" build >/dev/null 2>&1) && ok "image builds with SAPI_PACKAGES" || bad "package build"
+docker run --rm --entrypoint /usr/bin/file "$pkg_img" --version >/dev/null 2>&1 && ok "package is present in the image" || bad "package missing"
+docker image rm -f "$pkg_img" >/dev/null 2>&1 || true
+
 echo "sapi run (real container)"
 proj="$(mktemp -d)"; echo hello >"$proj/a.txt"
 set +e

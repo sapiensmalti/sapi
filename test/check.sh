@@ -89,6 +89,17 @@ check "insufficient space aborts"    bash -c "cd $proj && ! PATH=$shim:\$PATH $S
 check "prunes to backup_keep"        bash -c "cd $proj && for i in 1 2 3 4; do sleep 1; SAPI_BACKUP_KEEP=2 $S backup >/dev/null 2>&1; done; [[ \$($S backups | wc -l) == 2 ]] && [[ \$(ls '$(dirname "$b")' | wc -l) == 6 ]]"
 check "backup_keep=0 keeps all"      bash -c "cd $proj && SAPI_BACKUP_KEEP=0 $S backup >/dev/null 2>&1 && [[ \$($S backups | wc -l) == 3 ]]"
 
+echo "toolchain"
+check "packages normalised"            bash -c "cd $proj && $S config set packages 'golang, make  jq' && grep -qx 'packages = golang make jq' \$($S config path)"
+check "packages rejects shell metacharacters" bash -c "! $S config set packages 'x; rm -rf /' && ! $S config set packages '\$(id)' && ! $S config set packages 'a b/c'"
+check "packages appear in the effective Dockerfile" bash -c "cd $proj && $S dockerfile | grep -q 'apt-get install -y --no-install-recommends golang make jq'"
+check "packages change the image digest input" bash -c "cd $proj && [[ \$($S dockerfile | sha256sum) != \$(SAPI_PACKAGES=make $S dockerfile | sha256sum) ]]"
+check "Dockerfile.extra is appended when present" bash -c "printf 'RUN echo extra\\n' > $HOME/.config/sapi/Dockerfile.extra && cd $proj && $S dockerfile | grep -q '^RUN echo extra'"
+check "embedded Dockerfile comes first, unchanged" bash -c "cd $proj && $S dockerfile | grep -n '^ENTRYPOINT' | cut -d: -f1 | xargs -I{} test {} -lt \$($S dockerfile | grep -n 'RUN echo extra' | cut -d: -f1)"
+check "project-level Dockerfile.extra is ignored" bash -c "printf 'RUN evil\\n' > $proj/Dockerfile.extra && cd $proj && ! $S dockerfile | grep -q evil; rm -f $proj/Dockerfile.extra"
+check "dockerfile_extra path is configurable" bash -c "printf 'RUN elsewhere\\n' > $HOME/other.df && cd $proj && SAPI_DOCKERFILE_EXTRA=$HOME/other.df $S dockerfile | grep -q elsewhere"
+"$S" config set packages "" >/dev/null 2>&1 || sed -i.bak '/^packages/d' "$($S config path)"; rm -f "$HOME/.config/sapi/Dockerfile.extra"
+
 echo "diff / selective restore"
 rm -rf "$HOME/.local/share/sapi"; echo hello >"$proj/a.txt"; echo keep >"$proj/c.txt"
 (cd "$proj" && "$S" backup >/dev/null 2>&1)

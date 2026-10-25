@@ -27,6 +27,7 @@ AI coding agents run shell commands. Giving one your whole laptop is a bad trade
 - **Your files stay yours.** On Linux the agent runs as *your* uid/gid, so nothing comes out root-owned.
 - **Recoverable by construction.** `sapi --safer` takes a complete, checksummed backup before every start — stored where the agent cannot reach it — and refuses to start if it cannot. `sapi diff` shows every path the agent changed; `sapi restore latest --files …` puts any of them back. The sandbox protects everything outside the directory; this protects the directory itself.
 - **A Unix command.** `sapi run TASK` runs one headless task: final message on stdout, the agent's exit code, `--timeout`. In a cron job with safer mode, every run leaves a backup, a run manifest and a diff behind — auditable and reversible without the agent's cooperation.
+- **Your toolchain, your call.** `sapi config set packages "golang make"` or a `~/.config/sapi/Dockerfile.extra` extends the image; `sapi dockerfile` shows exactly what gets built. User-level only — a repository can never add a build step to your host.
 - **Persistent where it matters.** Credentials and settings live in one Docker volume; each project's sessions in another. Containers are disposable; `sapi` resumes or rebuilds them transparently.
 - **Hardened by default.** All Linux capabilities dropped except the few needed to drop privileges; `no-new-privileges`; no Docker socket; no host network.
 - **Always current.** `pi` self-updates on every start. If that fails (offline), it just starts.
@@ -84,6 +85,8 @@ All optional, all environment variables:
 | `SAPI_BACKUP_DIR` | `~/.local/share/sapi/backups` | where backups go; must be outside the directory |
 | `SAPI_BACKUP_KEEP` | `10` | backups kept per directory; `0` keeps all |
 | `SAPI_CPUS` / `SAPI_MEMORY_MIB` / `SAPI_PIDS` | unlimited / unlimited / `4096` | resource ceilings for the agent container |
+| `SAPI_PACKAGES` | | extra Debian packages baked into the image, e.g. `"golang make"` ([details](docs/toolchain.md)) |
+| `SAPI_DOCKERFILE_EXTRA` | `~/.config/sapi/Dockerfile.extra` | Dockerfile fragment appended when the file exists |
 | `SAPI_MODEL` | *(pi decides)* | Passed to `pi --model`, e.g. `openrouter/anthropic/claude-sonnet-4.5` |
 | `SAPI_PI_VERSION` | `latest` | pi npm version baked into the image |
 | `SAPI_AUTO_UPDATE` | `1` | `0` disables `pi update` on container start |
@@ -108,7 +111,7 @@ Every setting can also be set once in `~/.config/sapi/config` (`sapi config set 
 
 `sapi` hashes its embedded Dockerfile to name the image, so changing the definition (or upgrading `sapi`) naturally produces a fresh image. Containers are labelled with the workspace path, image, and settings; on start, `sapi` resumes a matching stopped container, replaces a stale one, or allocates a new slot if one is already running. Sessions survive all of this because they live in a volume.
 
-More: [architecture](docs/architecture.md) · [security model](docs/security.md) · [recovery: backup · run · diff · restore](docs/recovery.md) · [troubleshooting](docs/troubleshooting.md)
+More: [architecture](docs/architecture.md) · [security model](docs/security.md) · [recovery: backup · run · diff · restore](docs/recovery.md) · [toolchain](docs/toolchain.md) · [troubleshooting](docs/troubleshooting.md)
 
 ## Contributing
 
