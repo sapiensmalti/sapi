@@ -31,11 +31,11 @@ AI coding agents run shell commands. Giving one your whole laptop is a bad trade
 - **Egress allowlist, when you want it.** `sapi config set network allowlist`: a Rust sidecar owns the agent's network namespace — kernel-level redirection, fake DNS (no tunnelling), TLS-SNI and HTTP-Host filtering, connect-by-name. Only the hosts you list, on 80/443; everything else dropped and logged. Off by default.
 - **Persistent where it matters.** Credentials and settings live in one Docker volume; each project's sessions in another. Containers are disposable; `sapi` resumes or rebuilds them transparently.
 - **Hardened by default.** All Linux capabilities dropped except the few needed to drop privileges; `no-new-privileges`; no Docker socket; no host network; optional cpu/memory/pid ceilings.
-- **Always current.** `pi` self-updates on every start. If that fails (offline), it just starts.
+- **Current by default.** `pi` self-updates on agent start unless `SAPI_AUTO_UPDATE=0` (or the allowlist excludes npm). An offline update failure leaves the installed version usable. Pin versions when change control matters; see the supply-chain limits.
 
 ## Install
 
-**Requirements:** macOS or Ubuntu/Linux, `curl`, and Docker
+**Requirements:** macOS or Ubuntu/Linux, Bash, `curl`, standard Unix tools, and Docker 23+
 ([OrbStack](https://orbstack.dev) or Docker Desktop on macOS; `apt-get install docker.io` on Ubuntu).
 
 ```sh
@@ -49,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/sapiensmalti/sapi/main/install.sh -
 less install.sh && bash install.sh
 ```
 
-The installer puts one executable at `~/.local/bin/sapi` (override: `SAPI_INSTALL_DIR`). If that directory isn't on your `PATH`, it prints the one line to add. Nothing else is touched.
+The installer puts one executable at `~/.local/bin/sapi` (override: `SAPI_INSTALL_DIR`) and replaces it atomically. If that directory isn't on your `PATH`, it prints the one line to add. The downloaded launcher defaults to the newest release tag; `SAPI_REF=main` opts into development, and `sapi upgrade` follows later releases without remaining pinned to the installed one.
 
 **Uninstall:** `rm ~/.local/bin/sapi`. Remove containers and sessions with `sapi rm --all` first if you like, and `docker volume rm sapi-config` to forget credentials.
 
@@ -66,7 +66,7 @@ sapi backups         list this directory's backups
 sapi config          show or set persistent settings
 sapi shell           a shell in /pi-sessions (session files) with /pi-config beside it; --net for network
 sapi ls              list sapi containers
-sapi rm [--all]      remove this directory's containers (or all)
+sapi rm [--all]      remove this directory's containers + session volumes (or all; credentials stay)
 sapi build           build the image without starting
 sapi dockerfile      print the embedded Dockerfile
 sapi upgrade         upgrade sapi itself
@@ -97,9 +97,11 @@ All optional, all environment variables:
 | `SAPI_UID` / `SAPI_GID` | your uid/gid on Linux; `0` on macOS | user the agent runs as inside the container |
 | `SAPI_CONFIG_VOLUME` | `sapi-config` | Docker volume holding pi's config and credentials |
 | `SAPI_ENV` | | space-separated host variables to pass in, e.g. `"ANTHROPIC_API_KEY GH_TOKEN"` |
-| `SAPI_DOCKER_ARGS` | | extra flags for `docker create` (e.g. `-p 3000:3000`) |
+| `SAPI_DOCKER_ARGS` | | extra flags for `docker create` (e.g. `-p 3000:3000`). **Dangerous escape hatch:** arbitrary mounts/capabilities can defeat isolation |
 
-Every setting can also be set once in `~/.config/sapi/config` (`sapi config set safer true`; `sapi config keys` lists them). Precedence: flag > environment > config file > default.
+Every setting can also be set once in `~/.config/sapi/config` (`sapi config set safer true`; `sapi config keys` lists them). Precedence: flag > environment > config file > default, including a deliberately empty environment override. Config comments occupy a whole line; elsewhere `#` is literal.
+
+`SAPI_DOCKER_ARGS`, `SAPI_IMAGE`, `SAPI_EGRESS_IMAGE`, and Dockerfile fragments are explicit trust decisions, not part of the default sandbox guarantee. Never inherit them from an untrusted project. The config volume is also shared across projects; use a separate `SAPI_CONFIG_VOLUME` for a hostile one.
 
 ## How it works
 
@@ -132,11 +134,15 @@ The launcher is one readable file and stays that way; anything long-running or s
 
 - `sapi` — launcher, embedded Dockerfile and entrypoint
 - `install.sh` — installer
-- `egress/` — sidecar: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
-- `test/check.sh` — lint and unit checks (no Docker needed)
-- `test/smoke.sh` — builds the image and exercises it (needs Docker)
+- `egress/` — sidecar: `cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --all-features --locked && cargo deny check`
+- `test/check.sh` — lint and unit checks (no Docker; Linux + macOS)
+- `test/smoke.sh` — real image, container, restore, and firewall checks (Docker; Linux + macOS CI)
 
 Run both before opening a PR. Changes that add dependencies, touch the host outside `~/.local/bin`, or widen the container's access need a very good reason.
+
+## Security and changes
+
+[Private vulnerability reporting](SECURITY.md) · [Changelog](CHANGELOG.md)
 
 ## License
 

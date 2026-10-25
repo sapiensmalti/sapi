@@ -19,7 +19,7 @@ if ./sapi build; then ok "image builds"; else bad "image builds"; exit 1; fi
 
 harden=(--security-opt no-new-privileges --cap-drop ALL
     --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER
-    --cap-add SETUID --cap-add SETGID --cap-add SETPCAP)
+    --cap-add SETUID --cap-add SETGID)
 run() { docker run --rm --init "${harden[@]}" -e SAPI_AUTO_UPDATE=0 -v "$ws:/workspace" "$@"; }
 
 echo "entrypoint"
@@ -35,9 +35,9 @@ out="$(docker run --rm --init "${harden[@]}" -e SAPI_AUTO_UPDATE=0 -e SAPI_UID="
 # Replace `pi` with `id` by exec-ing the entrypoint logic via a wrapper on PATH.
 owner="$(docker run --rm --init "${harden[@]}" -e SAPI_AUTO_UPDATE=0 -e SAPI_UID="$uid" -e SAPI_GID="$gid" \
     -v "$ws:/workspace" --entrypoint /bin/bash "$SAPI_IMAGE" -c '
-        mkdir -p /tmp/fake && printf "#!/bin/sh\ntouch /workspace/probe; id -u; id -g; echo \$HOME\n" > /tmp/fake/pi && chmod +x /tmp/fake/pi
+        mkdir -p /tmp/fake && printf "#!/bin/sh\ntouch /workspace/probe; id -u; id -g; echo \$HOME; grep -E \"^Cap(Eff|Prm)\" /proc/self/status | tr \"\\t\" \" \" | cut -d\" \" -f2\n" > /tmp/fake/pi && chmod +x /tmp/fake/pi
         PATH=/tmp/fake:$PATH exec /usr/local/bin/sapi-entrypoint' 2>&1 | tr '\n' ' ')"
-[[ "$owner" == "$uid $gid /home/sapi " ]] && ok "drops to $uid:$gid with HOME=/home/sapi" || bad "privilege drop: got '$owner'"
+[[ "$owner" == "$uid $gid /home/sapi 0 0 " ]] && ok "drops to $uid:$gid with HOME=/home/sapi and no capabilities" || bad "privilege drop: got '$owner'"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
     got="$(stat -c '%u:%g' "$ws/probe")"
@@ -73,12 +73,22 @@ echo "egress allowlist (real firewall)"
 # plain container that shares its network namespace. CI has internet.
 if docker build -q -f egress/Dockerfile -t sapi-egress:smoke egress >/dev/null 2>&1; then ok "sidecar image builds"; else bad "sidecar image build"; fi
 docker rm -f smoke-egress >/dev/null 2>&1 || true
-docker run -d --name smoke-egress --init --security-opt no-new-privileges --cap-drop ALL \
-    --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
+docker run -d --name smoke-egress --init --read-only \
+    --tmpfs "/run:rw,noexec,nosuid,nodev,size=1048576,mode=755" \
+    --security-opt no-new-privileges --cap-drop ALL \
+    --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \
     -e EGRESS_ALLOW="api.github.com deb.debian.org" sapi-egress:smoke >/dev/null
 for _ in $(seq 1 50); do docker exec smoke-egress test -f /run/egress/ready 2>/dev/null && break; sleep 0.2; done
 docker exec smoke-egress test -f /run/egress/ready && ok "sidecar ready (firewall applied, privileges dropped)" || { bad "sidecar not ready"; docker logs smoke-egress; }
 docker exec smoke-egress ps -o user,comm 2>/dev/null | grep -q 'egress .*sapi-egress' && ok "proxy runs as the unprivileged uid" || bad "proxy uid: $(docker exec smoke-egress ps -o user,comm)"
+help="$(docker run --rm --entrypoint /usr/local/bin/sapi-egress sapi-egress:smoke --help)"
+! grep -qE 'no-firewall|test-upstream|allow-private' <<<"$help" && ok "production sidecar contains no test bypass flags" || bad "production bypass flags exposed"
+docker exec smoke-egress test -w / && bad "sidecar root filesystem is writable" || ok "sidecar root filesystem is read-only"
+docker restart smoke-egress >/dev/null
+for _ in $(seq 1 50); do docker exec smoke-egress test -f /run/egress/ready 2>/dev/null && break; sleep 0.2; done
+docker exec smoke-egress test -f /run/egress/ready && ok "sidecar becomes ready after a restart" || bad "sidecar restart readiness"
+[[ "$(docker exec -u 0 smoke-egress iptables -S | grep -c -- '-A OUTPUT -m owner --uid-owner 65532 -j ACCEPT')" == 1 ]] \
+    && ok "firewall restart does not accumulate duplicate rules" || bad "firewall rules duplicated on restart"
 agent() { local ep="$1"; shift; docker run --rm --network container:smoke-egress --cap-drop ALL --security-opt no-new-privileges --entrypoint "$ep" "$SAPI_IMAGE" "$@"; }
 # Allowed: HTTPS by SNI, relayed by name.
 agent curl -fsS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/ 2>/dev/null | grep -q '^[23]' && ok "allowed https host reachable" || bad "allowed https host unreachable"
@@ -121,7 +131,7 @@ docker rm -f smoke-egress >/dev/null 2>&1; docker image rm -f sapi-egress:smoke 
 echo "shell (real container)"
 # `sapi shell` needs a TTY; exercise the same path the launcher uses: the image entrypoint with SAPI_CMD=bash.
 uidargs=(); [[ "$(uname -s)" == Linux ]] && uidargs=(-e "SAPI_UID=$(id -u)" -e "SAPI_GID=$(id -g)")
-out="$(docker run --rm --network none --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
+out="$(docker run --rm --network none --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER --cap-add SETUID --cap-add SETGID \
     -v smoke-shell-cfg:/pi-config -v smoke-shell-sess:/pi-sessions -e SAPI_CMD=bash -e SAPI_AUTO_UPDATE=1 "${uidargs[@]}" --workdir /pi-sessions "$SAPI_IMAGE" -c 'pwd; id -u; touch probe && stat -c %u probe' 2>&1)"
 [[ "$(sed -n 1p <<<"$out")" == /pi-sessions ]] && ok "shell starts in /pi-sessions" || bad "shell cwd: $out"
 if [[ "$(uname -s)" == Linux ]]; then
@@ -143,6 +153,9 @@ set -e
 m="$(ls "$HOME"/.local/share/sapi/backups/*/*.run 2>/dev/null | tail -1)"
 [[ -n "$m" ]] && grep -q "^exit_code = [1-9]" "$m" && ok "--safer run wrote a manifest with the real exit code" || bad "run manifest: ${m:-none}"
 (cd "$proj" && echo changed >a.txt && ! "$sapi_bin" diff >/dev/null 2>&1) && ok "diff sees the change after a real run" || bad "diff"
+(cd "$proj" && "$sapi_bin" rm >/dev/null 2>&1)
+[[ -z "$(docker volume ls -q --filter "label=sh.sapi.workspace=$proj" --filter "label=sh.sapi.volume-role=sessions")" ]] \
+    && ok "sapi rm removes headless and interactive session volumes" || bad "session volumes left behind"
 rm -rf "$proj" "$HOME/.local/share/sapi"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

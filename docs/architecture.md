@@ -9,7 +9,8 @@
 | `install.sh` | repo root, fetched by `curl` | Downloads `sapi` to `~/.local/bin`. Nothing else. |
 | `sapi` | `~/.local/bin/sapi` | Launcher. Builds the image, manages containers and volumes, attaches your terminal. |
 | Dockerfile | embedded in `sapi` (`sapi dockerfile`) | `node:24-bookworm-slim` + git, ripgrep, jq, curl, ssh client + `pi` (npm) + `uv`. |
-| `sapi-entrypoint` | embedded in the Dockerfile, `/usr/local/bin/` in the image | Runs on every container start: optional `pi update`, then drops to your uid/gid and execs `pi`. |
+| `sapi-entrypoint` | embedded in the Dockerfile, `/usr/local/bin/` in the image | Optional `pi update`, ownership repair, uid/gid drop, then `pi` or `SAPI_CMD` (bash for `sapi shell`). |
+| `sapi-egress` | `egress/`, optional digest-pinned sidecar | Owns the allowlist namespace firewall, DNS answers, and hostname-filtered relays. |
 
 Everything is embedded in a single file so that *installing* means *copying one file*, and *reading the whole system* means *reading one file*.
 
@@ -29,8 +30,8 @@ On `sapi`:
    - **No container** → create it here.
    - **Not ours** (missing `sh.sapi.managed` label or different workspace hash) → next slot.
    - **Running** → next slot (you get a second, independent agent).
-   - **Stopped, and image/version/model/user/auto-update all match** → `docker start --attach`. Resume.
-   - **Stopped, something changed** → remove and recreate in this slot. The sessions volume is reused, so history survives.
+   - **Stopped, and image plus a full settings signature match** → `docker start --attach`. Resume. The signature covers network, model, user, update mode, CPU/memory/pid limits, config volume, environment names, and extra Docker arguments.
+   - **Stopped, something changed** → remove and recreate in this slot. The sessions volume is reused, so history survives. Containers using `SAPI_ENV` always refresh so changed secret values cannot become stale; secret values are never hashed into labels.
 4. `docker create` with the labels, mounts and hardening flags, then attach.
 
 Containers are cattle. Volumes are the only state:
@@ -38,16 +39,16 @@ Containers are cattle. Volumes are the only state:
 - `sapi-config` → `/pi-config` (`PI_CODING_AGENT_DIR`): auth, settings, extensions. Shared by every project.
 - `<container>-sessions` → `/pi-sessions` (`PI_CODING_AGENT_SESSION_DIR`): one per container slot.
 
-`sapi rm` removes containers and their session volumes but never the config volume.
+Volumes are labelled by role and workspace. `sapi rm` removes managed containers and all discoverable session volumes (interactive and headless), but never the config volume. Legacy unlabeled run volumes for the current directory are handled explicitly.
 
 ## Entrypoint
 
 ```
 pi update self --no-approve   (unless SAPI_AUTO_UPDATE=0; failure is non-fatal)
 if SAPI_UID != 0:
-    chown -R uid:gid /pi-config /pi-sessions /home/sapi   (only if ownership differs)
-    exec setpriv --reuid uid --regid gid --clear-groups env HOME=/home/sapi pi "$@"
-exec pi "$@"
+    chown -R uid:gid /pi-config /pi-sessions /pi-sessions-runs /home/sapi (if present and needed)
+    exec setpriv --reuid uid --regid gid --clear-groups env HOME=/home/sapi SAPI_CMD "$@"
+exec SAPI_CMD "$@"
 ```
 
 The update runs as root because npm's global prefix is root-owned; then privileges are dropped for good. On macOS the default is uid 0 because Docker Desktop and OrbStack translate ownership on bind mounts themselves; on Linux the bind mount is the real filesystem, so matching your uid is what keeps `git status` clean and `rm` working afterwards.
@@ -56,11 +57,13 @@ The update runs as root because npm's global prefix is root-owned; then privileg
 
 Settings are table-driven (`setting_spec`): one line per key gives type, environment variable and default; parsing, precedence (flag > environment > config file > default) and `sapi config` all read that table. The config file is whitelist-parsed, never sourced.
 
-`container_args` is the single source of the container specification — mounts, environment, hardening, resource ceilings — used by both the interactive start and `sapi run`. When safer mode is on, `backup_create` runs after the image build and before any container exists; `sapi run` additionally writes a run manifest beside the backup. `sapi diff` extracts the backup to a private temp dir and uses portable `diff -rq`. Guarantees and the unattended workflow are in [recovery.md](recovery.md).
+`container_args` is the single source of the container specification — mounts, environment, hardening, resource ceilings — used by interactive start, `sapi run`, and `sapi shell`. It returns a Bash array directly rather than serializing arguments through text.
+
+When safer mode is on, `backup_create` runs after the image build and before any container exists. A portable lock prevents concurrent writers; archive metadata completes before the archive becomes visible. `sapi run` writes its manifest atomically and its timeout/signal paths remove the active container. `sapi diff` compares content/type/mode/link manifests without following symlinks; restores are staged and swapped. Guarantees and the unattended workflow are in [recovery.md](recovery.md).
 
 ## Network egress allowlist
 
-Opt-in. `prepare_network` computes a signature of the expanded allowlist (part of the container's compatibility labels) and whether pi's self-update can run. `egress_start` pulls the digest-pinned sidecar image (or builds it from the pinned source tarball with `SAPI_EGRESS_BUILD=1`), starts it with `NET_ADMIN SETUID SETGID SETPCAP` only, and `egress_wait` blocks on its ready marker before the agent container is created with `--network container:<sidecar>`. The sidecar itself is [`egress/`](../egress): fake DNS, TLS-SNI and HTTP-Host filters, connect-by-name relay, iptables rule table — all pure functions with tests, plus one privileged setup step. Design and guarantees: [network.md](network.md).
+Opt-in. `prepare_network` computes a signature of the expanded allowlist (part of the container's compatibility labels) and whether pi's self-update can run. `egress_start` pulls the digest-pinned sidecar image (or builds it from the pinned source tarball with `SAPI_EGRESS_BUILD=1`), starts it read-only with `NET_ADMIN SETUID SETGID` only and a fresh `/run` tmpfs, and `egress_wait` blocks on its ready marker before the agent container is created with `--network container:<sidecar>`. The sidecar itself is [`egress/`](../egress): fake DNS, TLS-SNI and HTTP-Host filters, connect-by-name relay, iptables rule table — all pure functions with tests, plus one privileged setup step. Design and guarantees: [network.md](network.md).
 
 ## Shell
 
@@ -72,4 +75,4 @@ Docker is doing the heavy lifting: isolation, image caching, lifecycle. The laun
 
 ## Why `curl | bash`
 
-Because it is the deployment interface people actually use, and because the script is short enough to read first. `install.sh` pins the ref it fetches from (`SAPI_REF`, default `main`), validates the shebang and syntax of what it downloaded, and never escalates privileges. A two-step "download, read, run" is documented for anyone who prefers it.
+Because it is the deployment interface people actually use, and because the script is short enough to read first. `install.sh` pins the ref it fetches from (`SAPI_REF`, default the current release tag; `main` opts into development), validates the shebang and syntax, and atomically renames within the destination directory. It never escalates privileges. `sapi upgrade` fetches the current installer so an old release pin does not prevent future upgrades. A two-step "download, read, run" is documented for anyone who prefers it.

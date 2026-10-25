@@ -49,7 +49,11 @@ fn valid_label(label: &str) -> bool {
 /// Normalise a hostname: lower-case, strip one trailing dot. Returns `None`
 /// if it is not a syntactically valid DNS name.
 pub fn normalize_host(host: &str) -> Option<String> {
-    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let h = host
+        .trim()
+        .strip_suffix('.')
+        .unwrap_or(host.trim())
+        .to_ascii_lowercase();
     if h.is_empty() || h.len() > 253 || !h.split('.').all(valid_label) {
         return None;
     }
@@ -93,8 +97,10 @@ impl Entry {
                 let port: u16 = p
                     .parse()
                     .ok()
-                    .filter(|p| *p != 0)
-                    .ok_or_else(|| ParseError(format!("{raw}: bad port")))?;
+                    .filter(|p| matches!(p, 80 | 443))
+                    .ok_or_else(|| {
+                        ParseError(format!("{raw}: only ports 80 and 443 are supported"))
+                    })?;
                 (h, Some(port))
             }
             None => (raw, None),
@@ -169,11 +175,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_port_restricts() {
-        let l = list("example.com:8443");
-        assert!(l.allows("example.com", 8443));
-        assert!(!l.allows("example.com", 443));
+    fn explicit_port_restricts_to_the_two_redirected_ports() {
+        let l = list("example.com:443");
+        assert!(l.allows("example.com", 443));
         assert!(!l.allows("example.com", 80));
+        assert!(Allowlist::parse("example.com:8443").is_err());
+        assert!(Allowlist::parse("example.com:0").is_err());
     }
 
     #[test]
@@ -198,6 +205,8 @@ mod tests {
             "a.com:x",
             "a..com",
             ".a.com",
+            "a.com..",
+            "a.com:443:80",
         ] {
             assert!(Allowlist::parse(bad).is_err(), "{bad} should be rejected");
         }

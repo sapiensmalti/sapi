@@ -1,12 +1,17 @@
 [package]
 name = "sapi-egress"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Transparent egress allowlist sidecar for sapi: fake DNS, TLS-SNI and HTTP-Host filtering, connect-by-name relay."
 license = "MIT"
 repository = "https://github.com/sapiensmalti/sapi"
 publish = false
+
+[features]
+default = []
+# Integration-test hooks. Never enabled in the published container image.
+test-utils = []
 
 [[bin]]
 name = "sapi-egress"

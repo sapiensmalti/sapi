@@ -8,7 +8,7 @@
 set -Eeuo pipefail
 
 REPO="${SAPI_REPO:-sapiensmalti/sapi}"
-REF="${SAPI_REF:-main}"
+REF="${SAPI_REF:-main}" # RELEASE_PIN
 DIR="${SAPI_INSTALL_DIR:-$HOME/.local/bin}"
 URL="${SAPI_URL:-https://raw.githubusercontent.com/$REPO/$REF/sapi}"
 
@@ -27,7 +27,12 @@ head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash$' || die "downloaded file does n
 bash -n "$tmp" || die "downloaded file failed a syntax check"
 
 mkdir -p "$DIR"
-install -m 0755 "$tmp" "$DIR/sapi"
+new="$DIR/.sapi.new.$$"
+trap 'rm -f "$tmp" "$new"' EXIT
+install -m 0755 "$tmp" "$new"
+# Rename within the destination directory: a failed download or copy can
+# never truncate a working installation, and upgrade never follows a symlink.
+mv -f "$new" "$DIR/sapi"
 printf 'sapi install: installed %s (v%s)\n' "$DIR/sapi" "$("$DIR/sapi" version)"
 
 case ":$PATH:" in

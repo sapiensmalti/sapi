@@ -34,15 +34,15 @@ The sidecar is a separate container, `sapi-egress`, started *before* the agent a
 1. **Installs the namespace firewall** (as root, `CAP_NET_ADMIN`): `filter OUTPUT` and `INPUT` policy `DROP`; loopback allowed; its own uid allowed; for every *other* uid, TCP 443 → its TLS filter, TCP 80 → its HTTP filter, UDP/TCP 53 → its resolver; `ip6tables` policy `DROP`. If any rule fails to apply, the process exits non-zero and the agent is never started.
 2. **Binds** three loopback listeners.
 3. **Drops privileges** to uid 65532 — and verifies the drop is real by trying to regain root; if that succeeds, it refuses to run.
-4. **Writes a ready marker.** `sapi` waits for it (`docker exec … test -f /run/egress/ready`) before creating the agent container. There is no window in which the agent exists without the firewall.
+4. **Writes a ready marker.** `/run` is a fresh tmpfs on every start, so a restart cannot expose a stale marker; the process also removes any old marker at startup. `sapi` waits for the new file before creating/resuming the agent container. There is no window in which the agent intentionally starts without a completed firewall setup.
 5. **Answers DNS itself.** Allowed names get a fixed, non-routable answer (`198.18.0.1`); denied names get `NXDOMAIN`. The agent never performs a real DNS query, so **DNS tunnelling is closed**, and a denial is visible at the first step (`curl: Could not resolve host`).
-6. **Reads the hostname** from the TLS `ClientHello` SNI or the HTTP `Host` header (absolute-form request targets take precedence, per RFC 9112; duplicate `Host` headers are refused as a smuggling vector). No hostname — raw IP, non-TLS on 443, ESH — means deny.
+6. **Reads the hostname** from the TLS `ClientHello` SNI or the HTTP `Host` header (absolute-form request targets take precedence, per RFC 9112; duplicate/malformed `Host` headers are refused as smuggling vectors). No hostname — raw IP, non-TLS on 443, ECH without public SNI — means deny.
 7. **Connects by name.** The upstream address is always the proxy's own resolution of the *allowed name*, never the address the client dialled. A client cannot pair an allowed SNI with an attacker's IP. Names resolving to private, loopback, link-local, CGNAT or other non-public ranges are refused (DNS-rebinding defence).
 8. **Logs every decision** as one JSON line: `{"t":…,"ev":"allow|deny","proto":"dns|tls|http","host":…,"port":…,"reason":…,"upstream":…,"up":…,"down":…,"ms":…}`. `sapi netlog` prints them.
 
 Why not `HTTPS_PROXY`? Because it is advisory. Node's `fetch`, many CLIs, and anything malicious ignore it. Kernel redirection in a namespace the agent cannot modify is not advisory.
 
-Why not a well-known proxy with a config file? Because the policy here is one thing — "these names, these two ports" — and 900 lines of Rust that can only express that policy are easier to audit than a general-purpose proxy's configuration surface. There is no bypass flag in the binary.
+Why not a well-known proxy with a config file? Because the policy here is one thing — "these names, these two ports" — and a small Rust binary that can only express that policy is easier to audit than a general-purpose proxy's configuration surface. There is no bypass flag in the production binary; test hooks require the `test-utils` Cargo feature and are absent from the published image.
 
 ## Allowlist syntax
 
@@ -50,10 +50,10 @@ Why not a well-known proxy with a config file? Because the policy here is one th
 |---|---|
 | `api.anthropic.com` | exactly that host, on 80 and 443 |
 | `*.github.com` | any subdomain — not `github.com` itself |
-| `registry.example:8443` | that host, only on that port |
+| `registry.example:443` | that host on 443 only (the only explicit ports are 80 and 443) |
 | `@providers` | preset (below) |
 
-Comma or space separated. Validated twice — by `sapi` when you set it, and by the sidecar at start — and anything that is not a hostname, `*.suffix`, `host:port` or known preset is rejected. A typo cannot become a hole.
+Comma or space separated. Validated twice — by `sapi` when you set it, and by the sidecar at start. Only DNS-valid names, `*.suffix`, optional `:80`/`:443`, and known presets are accepted. Other ports are rejected because the firewall deliberately never redirects them. Wildcards are passed literally, never expanded against project filenames. A typo cannot become a hole.
 
 Presets:
 
@@ -77,7 +77,9 @@ Presets:
 - **Publishing ports** (`SAPI_DOCKER_ARGS=-p …`) does not work in allowlist mode: inbound is dropped and the port would have to be on the sidecar. Run dev servers in `full` mode.
 - **Resume** restarts the sidecar first and waits for the firewall before the agent's namespace comes back. If the sidecar was removed, the agent container is recreated.
 - **Changing `allow`** changes the container's network signature, so the next start recreates the pair (sessions are kept, as always).
-- The sidecar is capped at 256 MiB and 256 processes and runs with `cap-drop ALL` plus `NET_ADMIN SETUID SETGID SETPCAP` — the first for the rules, the rest to drop them.
+- The sidecar is capped at 256 MiB and 256 processes, has a read-only root filesystem plus a 1 MiB `/run` tmpfs, and runs with `cap-drop ALL` plus only `NET_ADMIN SETUID SETGID`. Its listener rules are flushed after deny policies on restart, so rules cannot accumulate.
+- The agent must not run as uid 65532: that uid belongs to the proxy and is exempt for its own upstream traffic. `sapi` refuses this collision rather than silently opening egress.
+- Production images do not contain `--no-firewall`, `--allow-private`, or `--test-upstream`; those hooks exist only in `cargo test --all-features` builds.
 
 ## Where the sidecar image comes from
 
@@ -99,4 +101,4 @@ builds the sidecar locally from the pinned, checksum-verified source tarball (a 
 
 ## Verifying it yourself
 
-`test/smoke.sh` runs on every CI build with real Docker: builds the sidecar, starts it, and from a container sharing its namespace proves that an allowed HTTPS host and an allowed HTTP host are reachable, that a denied name, a non-80/443 port and a raw IP are not, that a container without `NET_ADMIN` cannot alter the rules, and that both `allow` and `deny` decisions were logged. The Rust crate's own tests cover the parsers byte-by-byte, the relay's address filter, the firewall rule table, and a live relay through a fake upstream. Read [`egress/src`](../egress/src); it is short on purpose.
+`test/smoke.sh` runs on Ubuntu and macOS CI with real Docker: builds the sidecar, starts it, and from a container sharing its namespace proves that allowed HTTPS/HTTP are reachable, that a denied name, a non-80/443 port and a raw IP are not, that a container without `NET_ADMIN` cannot alter the rules, that restarts are ready and idempotent, that the root filesystem is read-only, and that decisions are logged. The Rust crate's own tests cover the parsers byte-by-byte, the relay's address filter, the firewall rule table, and a live relay through a fake upstream. Read [`egress/src`](../egress/src); it is short on purpose.

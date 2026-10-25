@@ -68,6 +68,13 @@ pub fn rules(uid: u32, ports: Ports) -> Vec<(&'static str, Vec<String>)> {
         v4(&["-P", "OUTPUT", "DROP"]),
         v4(&["-P", "INPUT", "DROP"]),
         v4(&["-P", "FORWARD", "DROP"]),
+        // A sidecar can be restarted in an existing namespace. Start from an
+        // empty built-in chain so restarts cannot accumulate duplicate rules.
+        // Policies are already DROP, so flushing cannot open a window.
+        v4(&["-F", "OUTPUT"]),
+        v4(&["-F", "INPUT"]),
+        v4(&["-F", "FORWARD"]),
+        v4(&["-t", "nat", "-F", "OUTPUT"]),
         v4(&["-A", "INPUT", "-i", "lo", "-j", "ACCEPT"]),
         v4(&[
             "-A",
@@ -216,6 +223,9 @@ pub fn rules(uid: u32, ports: Ports) -> Vec<(&'static str, Vec<String>)> {
         v6(&["-P", "OUTPUT", "DROP"]),
         v6(&["-P", "INPUT", "DROP"]),
         v6(&["-P", "FORWARD", "DROP"]),
+        v6(&["-F", "OUTPUT"]),
+        v6(&["-F", "INPUT"]),
+        v6(&["-F", "FORWARD"]),
         v6(&["-A", "INPUT", "-i", "lo", "-j", "ACCEPT"]),
         v6(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]),
     ]
@@ -250,6 +260,11 @@ mod tests {
             .collect();
         assert!(joined.iter().any(|l| l == "iptables -P OUTPUT DROP"));
         assert!(joined.iter().any(|l| l == "ip6tables -P OUTPUT DROP"));
+        for chain in ["OUTPUT", "INPUT", "FORWARD"] {
+            assert!(joined.iter().any(|l| l == &format!("iptables -F {chain}")));
+            assert!(joined.iter().any(|l| l == &format!("ip6tables -F {chain}")));
+        }
+        assert!(joined.iter().any(|l| l == "iptables -t nat -F OUTPUT"));
         assert!(joined
             .iter()
             .any(|l| l.contains("--uid-owner 65532 -j ACCEPT")));

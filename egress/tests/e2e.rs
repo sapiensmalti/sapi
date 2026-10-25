@@ -2,6 +2,7 @@
 //! `--no-firewall` keeps everything in user space and `--test-upstream`
 //! points every allowed connection at a local echo server.
 
+#![cfg(feature = "test-utils")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

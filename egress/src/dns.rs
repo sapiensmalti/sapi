@@ -35,6 +35,9 @@ pub fn parse_question(msg: &[u8]) -> Option<Question> {
     if flags & 0x8000 != 0 {
         return None; // a response, not a query
     }
+    if flags & 0x7800 != 0 {
+        return None; // only standard queries (opcode 0)
+    }
     let qdcount = u16::from_be_bytes([*msg.get(4)?, *msg.get(5)?]);
     if qdcount != 1 {
         return None;
@@ -146,6 +149,11 @@ mod tests {
             *b |= 0x80;
         }
         assert!(parse_question(&r).is_none());
+        let mut opcode = query("a.com", 1);
+        if let Some(b) = opcode.get_mut(2) {
+            *b |= 0x08;
+        }
+        assert!(parse_question(&opcode).is_none());
         let mut m = query("a.com", 1);
         if let Some(b) = m.get_mut(5) {
             *b = 2;

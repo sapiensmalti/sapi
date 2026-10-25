@@ -68,13 +68,16 @@ struct Cli {
     /// Written once the firewall is up and the listeners are bound.
     #[arg(long, default_value = "/run/egress/ready")]
     ready_file: PathBuf,
-    /// Permit upstream addresses in private/loopback ranges (off by default).
+    /// Permit upstream addresses in private/loopback ranges (test builds only).
+    #[cfg(feature = "test-utils")]
     #[arg(long)]
     allow_private: bool,
-    /// Do not touch iptables and do not drop privileges (tests only).
+    /// Do not touch iptables and do not drop privileges (test builds only).
+    #[cfg(feature = "test-utils")]
     #[arg(long)]
     no_firewall: bool,
-    /// Send every upstream connection here instead of the resolved address (tests only).
+    /// Send every upstream connection here (test builds only).
+    #[cfg(feature = "test-utils")]
     #[arg(long)]
     test_upstream: Option<SocketAddr>,
 }
@@ -85,6 +88,16 @@ struct State {
     allow_private: bool,
     test_upstream: Option<SocketAddr>,
     limiter: Arc<Semaphore>,
+}
+
+#[cfg(feature = "test-utils")]
+fn execution_options(cli: &Cli) -> (bool, bool, Option<SocketAddr>) {
+    (cli.no_firewall, cli.allow_private, cli.test_upstream)
+}
+
+#[cfg(not(feature = "test-utils"))]
+fn execution_options(_cli: &Cli) -> (bool, bool, Option<SocketAddr>) {
+    (false, false, None)
 }
 
 #[derive(Serialize)]
@@ -149,6 +162,16 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli, allow: Allowlist) -> Result<()> {
+    let (no_firewall, allow_private, test_upstream) = execution_options(&cli);
+    // A container restart must never expose last boot's readiness. The
+    // launcher additionally mounts /run/egress as a fresh tmpfs.
+    match std::fs::remove_file(&cli.ready_file) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("remove stale {}", cli.ready_file.display()))
+        }
+    }
     let ports = firewall::Ports {
         dns: cli.dns_port,
         tls: cli.tls_port,
@@ -156,7 +179,7 @@ async fn run(cli: Cli, allow: Allowlist) -> Result<()> {
     };
 
     // 1. Firewall first: from this instant nothing but the proxy uid can leave.
-    if !cli.no_firewall {
+    if !no_firewall {
         firewall::apply(cli.uid, ports).context("firewall")?;
     }
 
@@ -174,15 +197,25 @@ async fn run(cli: Cli, allow: Allowlist) -> Result<()> {
         .await
         .context("bind http")?;
 
-    // 3. Drop privileges for good.
-    if !cli.no_firewall {
+    // 3. Create the readiness directory while privileged. /run is a fresh
+    // tmpfs in production; iptables also uses it for xtables.lock.
+    if let Some(dir) = cli.ready_file.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        if !no_firewall {
+            use std::os::unix::fs::PermissionsExt;
+            // Only a readiness marker lives here, and the agent has a
+            // different mount namespace. The proxy uid must be able to write.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
+                .with_context(|| format!("chmod {}", dir.display()))?;
+        }
+    }
+
+    // 4. Drop privileges for good.
+    if !no_firewall {
         drop_privileges(cli.uid)?;
     }
 
-    // 4. Signal readiness. The launcher waits for this before creating the agent.
-    if let Some(dir) = cli.ready_file.parent() {
-        std::fs::create_dir_all(dir).ok();
-    }
+    // 5. Signal readiness. The launcher waits for this before creating the agent.
     std::fs::write(&cli.ready_file, b"ready\n")
         .with_context(|| format!("write {}", cli.ready_file.display()))?;
     eprintln!(
@@ -196,8 +229,8 @@ async fn run(cli: Cli, allow: Allowlist) -> Result<()> {
 
     let state = State {
         allow: Arc::new(allow),
-        allow_private: cli.allow_private,
-        test_upstream: cli.test_upstream,
+        allow_private,
+        test_upstream,
         limiter: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
     };
 
@@ -349,7 +382,8 @@ async fn read_head(
     let deadline = tokio::time::Instant::now() + HEAD_TIMEOUT;
     loop {
         match sniff(&buf) {
-            Sniff::Host(h) => return Ok((buf, h)),
+            Sniff::Host(h) if buf.len() <= HEAD_LIMIT => return Ok((buf, h)),
+            Sniff::Host(_) => return Err("header too large"),
             Sniff::Invalid => return Err("unrecognised protocol or no hostname"),
             Sniff::Incomplete => {}
         }

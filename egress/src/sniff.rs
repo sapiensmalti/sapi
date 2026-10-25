@@ -22,6 +22,14 @@ fn be16(b: &[u8], at: usize) -> Option<usize> {
     ])))
 }
 
+fn be24(b: &[u8], at: usize) -> Option<usize> {
+    Some(
+        (usize::from(*b.get(at)?) << 16)
+            | (usize::from(*b.get(at + 1)?) << 8)
+            | usize::from(*b.get(at + 2)?),
+    )
+}
+
 /// TLS `ClientHello` → SNI host name.
 pub fn tls_sni(buf: &[u8]) -> Sniff {
     // TLS record: type(1)=0x16, version(2), length(2)
@@ -47,6 +55,12 @@ pub fn tls_sni(buf: &[u8]) -> Sniff {
     if hs.first() != Some(&1) {
         return Sniff::Invalid;
     }
+    let Some(handshake_len) = be24(hs, 1) else {
+        return Sniff::Invalid;
+    };
+    if handshake_len + 4 != hs.len() {
+        return Sniff::Invalid;
+    }
     let mut p = 4 + 2 + 32;
     let Some(&sid_len) = hs.get(p) else {
         return Sniff::Invalid;
@@ -64,9 +78,13 @@ pub fn tls_sni(buf: &[u8]) -> Sniff {
         return Sniff::Invalid;
     };
     p += 2;
+    if p + ext_total != hs.len() {
+        return Sniff::Invalid;
+    }
     let Some(exts) = hs.get(p..p + ext_total) else {
         return Sniff::Invalid;
     };
+    let mut server_name: Option<String> = None;
     let mut q = 0;
     while q + 4 <= exts.len() {
         let (Some(ext_type), Some(ext_len)) = (be16(exts, q), be16(exts, q + 2)) else {
@@ -77,35 +95,47 @@ pub fn tls_sni(buf: &[u8]) -> Sniff {
             return Sniff::Invalid;
         };
         if ext_type == 0 {
-            // server_name: list_len(2), then entries: type(1)=0, len(2), name
-            let Some(list_len) = be16(ext, 0) else {
-                return Sniff::Invalid;
-            };
-            let Some(list) = ext.get(2..2 + list_len) else {
-                return Sniff::Invalid;
-            };
-            let mut r = 0;
-            while r + 3 <= list.len() {
-                let name_type = list.get(r).copied();
-                let Some(name_len) = be16(list, r + 1) else {
-                    return Sniff::Invalid;
-                };
-                let Some(name) = list.get(r + 3..r + 3 + name_len) else {
-                    return Sniff::Invalid;
-                };
-                if name_type == Some(0) {
-                    return match std::str::from_utf8(name) {
-                        Ok(s) if !s.is_empty() && s.is_ascii() => Sniff::Host(s.to_owned()),
-                        _ => Sniff::Invalid,
-                    };
-                }
-                r += 3 + name_len;
+            if server_name.is_some() {
+                return Sniff::Invalid; // duplicate SNI extension
             }
-            return Sniff::Invalid;
+            server_name = parse_sni_extension(ext);
+            if server_name.is_none() {
+                return Sniff::Invalid;
+            }
         }
         q += ext_len;
     }
-    Sniff::Invalid // complete ClientHello without SNI: cannot route by name
+    if q != exts.len() {
+        return Sniff::Invalid;
+    }
+    server_name.map_or(Sniff::Invalid, Sniff::Host)
+}
+
+/// Parse one SNI extension. Exactly one ASCII `host_name` is required.
+fn parse_sni_extension(ext: &[u8]) -> Option<String> {
+    let list_len = be16(ext, 0)?;
+    if list_len + 2 != ext.len() {
+        return None;
+    }
+    let list = ext.get(2..2 + list_len)?;
+    let mut server_name: Option<String> = None;
+    let mut r = 0;
+    while r < list.len() {
+        let name_type = list.get(r).copied();
+        let name_len = be16(list, r + 1)?;
+        let name = list.get(r + 3..r + 3 + name_len)?;
+        if name_type == Some(0) {
+            if server_name.is_some() {
+                return None; // RFC 6066 permits one host_name
+            }
+            match std::str::from_utf8(name) {
+                Ok(s) if !s.is_empty() && s.is_ascii() => server_name = Some(s.to_owned()),
+                _ => return None,
+            }
+        }
+        r += 3 + name_len;
+    }
+    server_name
 }
 
 /// HTTP/1.x request head → Host (without port).
@@ -134,19 +164,34 @@ pub fn http_host(buf: &[u8]) -> Sniff {
     }
     // Absolute-form target wins over Host (RFC 9112 §3.2.2).
     let target = request_line.split(' ').nth(1).unwrap_or("");
-    if let Some(rest) = target.strip_prefix("http://") {
-        let authority = rest.split('/').next().unwrap_or("");
+    if target
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+    {
+        let rest = target.get(7..).unwrap_or_default();
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
         return host_without_port(authority);
+    }
+    if target.contains("://") {
+        return Sniff::Invalid;
     }
     let mut host: Option<&str> = None;
     for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("host") {
-                if host.is_some() {
-                    return Sniff::Invalid; // duplicate Host headers are a smuggling vector
-                }
-                host = Some(v.trim());
+        let Some((k, v)) = line.split_once(':') else {
+            return Sniff::Invalid;
+        };
+        if k.is_empty()
+            || !k
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        {
+            return Sniff::Invalid; // includes whitespace before ':' and obs-fold
+        }
+        if k.eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return Sniff::Invalid; // duplicate Host headers are a smuggling vector
             }
+            host = Some(v.trim());
         }
     }
     match host {
@@ -156,12 +201,22 @@ pub fn http_host(buf: &[u8]) -> Sniff {
 }
 
 fn host_without_port(authority: &str) -> Sniff {
-    if authority.starts_with('[') {
-        return Sniff::Invalid; // IPv6 literals are not names; we route by name only
+    if authority.is_empty() || authority.contains(['@', '[', ']']) {
+        return Sniff::Invalid; // no userinfo or IP literals: we route by DNS name
     }
-    let host = authority.split(':').next().unwrap_or("");
+    let mut parts = authority.split(':');
+    let host = parts.next().unwrap_or_default();
     if host.is_empty() {
         return Sniff::Invalid;
+    }
+    if let Some(port) = parts.next() {
+        if parts.next().is_some()
+            || port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().ok().as_ref().is_none_or(|p| *p == 0)
+        {
+            return Sniff::Invalid;
+        }
     }
     Sniff::Host(host.to_owned())
 }
@@ -290,6 +345,46 @@ mod tests {
             http_host(b"GET http://a.example/p HTTP/1.1\r\nHost: b.example\r\n\r\n"),
             Sniff::Host("a.example".into())
         );
+        assert_eq!(
+            http_host(b"GET HTTP://a.example/p HTTP/1.1\r\nHost: b.example\r\n\r\n"),
+            Sniff::Host("a.example".into())
+        );
+    }
+
+    #[test]
+    fn malformed_authorities_and_headers_are_rejected() {
+        for authority in [
+            "a.example:",
+            "a.example:http",
+            "a.example:80:90",
+            "a.example@evil.test",
+            "a.example:0",
+        ] {
+            let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+            assert_eq!(http_host(request.as_bytes()), Sniff::Invalid, "{authority}");
+        }
+        assert_eq!(
+            http_host(b"GET / HTTP/1.1\r\nHost : a.example\r\n\r\n"),
+            Sniff::Invalid
+        );
+        assert_eq!(
+            http_host(b"GET / HTTP/1.1\r\nHost: a.example\r\n folded\r\n\r\n"),
+            Sniff::Invalid
+        );
+        assert_eq!(
+            http_host(b"GET https://a.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n"),
+            Sniff::Invalid
+        );
+    }
+
+    #[test]
+    fn inconsistent_tls_lengths_are_rejected() {
+        let mut hello = client_hello(Some("a.example"));
+        // The three-byte ClientHello handshake length starts at record byte 6.
+        if let Some(last) = hello.get_mut(8) {
+            *last = last.wrapping_add(1);
+        }
+        assert_eq!(tls_sni(&hello), Sniff::Invalid);
     }
 
     #[test]

@@ -60,14 +60,20 @@ You ran sapi in a directory that contains the backup folder (for example your ho
 The destination has less free space than the directory is large. Free space, or set `backup_dir` to another volume. Backups are never skipped silently in safer mode.
 
 **`sapi: unknown setting` on start**
-A typo in `~/.config/sapi/config`. Known keys: `safer`, `backup_dir`, `backup_keep`. `sapi config path` prints the file.
+A typo or invalid value in `~/.config/sapi/config`. `sapi config keys` lists every supported key and type; `sapi config path` prints the file. Comments must occupy a whole line; elsewhere `#` is literal.
 
 **Backups are slow or large**
 They include everything, by design. Keep build output and `node_modules` out of directories you run sapi in, or accept the cost. `backup_keep` bounds how many are kept.
+
+**`sapi: backup: another backup … is in progress`**
+Another sapi process is archiving the same directory; wait for it. After a crash, a stale lock is recovered automatically. Never delete a lock whose pid is still running.
+
+**A directory restore removed a new file**
+`restore --files DIR` replaces the selected directory exactly as it was in the backup; additions beneath it are removed. Restore individual files when you need a merge, or whole-tree restore beside the original and compare first.
 
 **Where are the session files?**
 `sapi shell` puts you in `/pi-sessions` (interactive) with `/pi-sessions-runs` (headless runs) and `/pi-config` beside it. From the host, the Docker volumes are `sapi-<dir>-<hash>-sessions`, `…-runs-sessions` and `sapi-config`.
 
 **Still stuck**
-Run `sapi dockerfile` and `docker info`, and open an issue with the output and your OS.
+Run `sapi dockerfile`, `sapi config show`, and `docker info`; open an issue with the output and your OS (redact credentials and personal paths). Security findings go through [SECURITY.md](../SECURITY.md), not a public issue.
 

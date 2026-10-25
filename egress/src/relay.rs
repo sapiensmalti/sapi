@@ -42,7 +42,7 @@ impl std::fmt::Display for RelayError {
 pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        IpAddr::V6(v6) => match v6.to_ipv4() {
             Some(v4) => is_public_v4(v4),
             None => is_public_v6(v6),
         },
@@ -51,9 +51,10 @@ pub fn is_public(ip: IpAddr) -> bool {
 
 fn is_public_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    let (a, b) = (
+    let (a, b, c) = (
         o.first().copied().unwrap_or(0),
         o.get(1).copied().unwrap_or(0),
+        o.get(2).copied().unwrap_or(0),
     );
     !(ip.is_private()
         || ip.is_loopback()
@@ -64,6 +65,8 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || ip.is_documentation()
         || a == 0
         || (a == 100 && (64..=127).contains(&b)) // CGNAT 100.64/10
+        || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24 protocol assignments
+        || (a == 192 && b == 88 && c == 99) // 192.88.99.0/24, deprecated 6to4 relay anycast
         || (a == 198 && (18..=19).contains(&b)) // benchmarking 198.18/15 (our sink)
         || a >= 240) // reserved + 255/8
 }
@@ -71,12 +74,20 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
 fn is_public_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
     let first = s.first().copied().unwrap_or(0);
-    !(ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (first & 0xfe00) == 0xfc00 // unique local fc00::/7
-        || (first & 0xffc0) == 0xfe80 // link-local fe80::/10
-        || first == 0x2001 && s.get(1) == Some(&0x0db8)) // documentation
+    // Only global unicast 2000::/3 is eligible. This conservatively excludes
+    // IPv4-compatible, NAT64, discard-only, site-local and other special-use
+    // ranges instead of trying to enumerate every non-2000::/3 allocation.
+    (first & 0xe000) == 0x2000
+        && !(ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || (first & 0xfe00) == 0xfc00 // unique local fc00::/7
+            || (first & 0xffc0) == 0xfe80 // link-local fe80::/10
+            || first == 0x2001 && s.get(1) == Some(&0x0db8) // documentation
+            || first == 0x2001 && s.get(1) == Some(&0x0002) && s.get(2) == Some(&0) // benchmarking
+            || first == 0x2001 && s.get(1).is_some_and(|v| v & 0xfff0 == 0x0010) // ORCHID
+            || first == 0x2001 && *s.get(1).unwrap_or(&0) == 0 // Teredo 2001::/32
+            || first == 0x2002) // 6to4: embedded private addresses are not public
 }
 
 /// Resolve `host:port`, filter, connect.
@@ -156,12 +167,22 @@ mod tests {
             "224.0.0.1",
             "240.0.0.1",
             "255.255.255.255",
+            "192.0.0.1",
+            "192.88.99.1",
             "::1",
             "fe80::1",
             "fd00::1",
             "::",
             "ff02::1",
             "::ffff:10.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::1",
+            "100::1",
+            "fec0::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:10::1",
+            "2002::1",
             "2001:db8::1",
         ] {
             let ip: IpAddr = bad.parse().unwrap();
@@ -173,6 +194,8 @@ mod tests {
             "140.82.112.3",
             "2606:4700::1111",
             "::ffff:1.1.1.1",
+            "192.0.1.1", // outside 192.0.0.0/24
+            "192.88.98.1",
         ] {
             let ip: IpAddr = good.parse().unwrap();
             assert!(is_public(ip), "{good} must be public");
