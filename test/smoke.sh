@@ -193,7 +193,7 @@ grep -qi model <<<"$out$(cat "$ws/run.err")" && ok "pi error surfaced" || bad "n
 set +e
 (cd "$proj" && SAPI_MODEL=bogus/none SAPI_AUTO_UPDATE=0 SAPI_IMAGE="$SAPI_IMAGE" "$sapi_bin" --safer run "x" >/dev/null 2>&1)
 set -e
-m="$(ls "$HOME"/.local/share/sapi/backups/*/*.run 2>/dev/null | tail -1)"
+m="$(ls "$SAPI_BACKUP_DIR"/*/*.run 2>/dev/null | tail -1)"
 [[ -n "$m" ]] && grep -q "^exit_code = [1-9]" "$m" && ok "--safer run wrote a manifest with the real exit code" || bad "run manifest: ${m:-none}"
 (cd "$proj" && echo changed >a.txt && ! "$sapi_bin" diff >/dev/null 2>&1) && ok "diff sees the change after a real run" || bad "diff"
 if (cd "$proj" && "$sapi_bin" rm); then ok "sapi rm completes with session volumes present"; else bad "sapi rm failed"; fi
