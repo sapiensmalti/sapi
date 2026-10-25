@@ -82,6 +82,16 @@ docker exec smoke-egress ps -o user,comm 2>/dev/null | grep -q 'egress .*sapi-eg
 agent() { local ep="$1"; shift; docker run --rm --network container:smoke-egress --cap-drop ALL --security-opt no-new-privileges --entrypoint "$ep" "$SAPI_IMAGE" "$@"; }
 # Allowed: HTTPS by SNI, relayed by name.
 agent curl -fsS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/ 2>/dev/null | grep -q '^[23]' && ok "allowed https host reachable" || bad "allowed https host unreachable"
+if (( fail > 0 )); then
+    echo "--- diagnostics"
+    echo "curl:"; agent curl -sS -m 10 -v https://api.github.com/ 2>&1 | tail -n 8 || true
+    echo "getent:"; agent bash -c 'getent hosts api.github.com; cat /etc/resolv.conf' 2>&1 || true
+    echo "iptables (filter):"; docker exec -u 0 smoke-egress iptables -S 2>&1 || true
+    echo "iptables (nat):"; docker exec -u 0 smoke-egress iptables -t nat -S 2>&1 || true
+    echo "iptables backend:"; docker exec -u 0 smoke-egress iptables -V 2>&1 || true
+    echo "listeners:"; docker exec -u 0 smoke-egress netstat -tulpn 2>&1 | head -n 10 || docker exec -u 0 smoke-egress cat /proc/net/tcp 2>&1 | head -n 5 || true
+    echo "sidecar log:"; docker logs smoke-egress 2>&1 | tail -n 5
+fi
 # Allowed: plain HTTP by Host header.
 agent curl -fsS -m 20 -o /dev/null -w '%{http_code}' http://deb.debian.org/debian/ 2>/dev/null | grep -q '^[23]' && ok "allowed http host reachable" || bad "allowed http host unreachable"
 # Denied: name not in list → NXDOMAIN at the fake resolver.
