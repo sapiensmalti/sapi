@@ -5,7 +5,7 @@
 # One file. No dependencies beyond bash, docker and coreutils.
 set -Eeuo pipefail
 
-readonly SAPI_VERSION="0.5.0"
+readonly SAPI_VERSION="0.6.0"
 readonly SAPI_REPO="${SAPI_REPO:-sapiensmalti/sapi}"
 readonly SAPI_REF="${SAPI_REF:-main}"
 readonly IMAGE_REPOSITORY="sapi"
@@ -53,24 +53,27 @@ RUN npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@${PI_
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # Entrypoint: optional self-update, then drop to the host user (Linux) so files
-# written to /workspace are owned by you, not root.
+# written to /workspace are owned by you, not root. SAPI_CMD selects what
+# runs after the drop (default pi; `sapi shell` uses bash).
 COPY <<'ENTRYPOINT_EOF' /usr/local/bin/sapi-entrypoint
 #!/bin/bash
 set -eu
-if [ "${SAPI_AUTO_UPDATE:-1}" = "1" ]; then
+cmd="${SAPI_CMD:-pi}"
+if [ "$cmd" = "pi" ] && [ "${SAPI_AUTO_UPDATE:-1}" = "1" ]; then
     pi update self --no-approve >&2 \
         || printf 'sapi: pi update failed; using installed pi %s\n' "$(pi --version 2>/dev/null)" >&2
 fi
 uid="${SAPI_UID:-0}"
 gid="${SAPI_GID:-0}"
 if [ "$uid" != "0" ]; then
-    for dir in /pi-config /pi-sessions /home/sapi; do
+    for dir in /pi-config /pi-sessions /pi-sessions-runs /home/sapi; do
+        [ -d "$dir" ] || continue
         [ "$(stat -c '%u:%g' "$dir")" = "$uid:$gid" ] || chown -R "$uid:$gid" "$dir"
     done
     exec setpriv --reuid "$uid" --regid "$gid" --clear-groups \
-        env HOME=/home/sapi USER=sapi pi "$@"
+        env HOME=/home/sapi USER=sapi "$cmd" "$@"
 fi
-exec pi "$@"
+exec "$cmd" "$@"
 ENTRYPOINT_EOF
 RUN chmod 0755 /usr/local/bin/sapi-entrypoint
 
@@ -116,7 +119,9 @@ Usage:
                      Show or change persistent settings
   sapi ls            List sapi containers
   sapi rm [--all]    Remove this directory's containers (or all of them)
-  sapi shell [NAME]  Open a bash shell inside the running container
+  sapi shell [NAME] [--net]
+                     A shell in /pi-sessions (session files) with /pi-config beside it; joins the running
+                     agent, or starts an ephemeral container with the same volumes (no network unless --net)
   sapi netlog [NAME] Egress decisions (allow/deny, JSON lines) when network = allowlist
   sapi build         Build the image without starting a container
   sapi dockerfile    Print the embedded Dockerfile
@@ -685,14 +690,72 @@ cmd_rm() {
     log "kept config volume $CONFIG_VOLUME (credentials). Remove with: docker volume rm $CONFIG_VOLUME"
 }
 
+# ---------------------------------------------------------------------------
+# sapi shell [NAME] [--net]: a shell where pi's files live
+#
+# Lands in /pi-sessions, the directory holding the session JSONL files. If an
+# agent container for this directory is running, exec into it; otherwise
+# start an ephemeral container with the same hardening and the same volumes
+# (config, this directory's sessions, its headless-run sessions). Ephemeral
+# shells have no network unless --net is given: a shell with the credentials
+# volume mounted should not have egress by accident.
+# ---------------------------------------------------------------------------
+shell_banner() {
+    printf '\n  /pi-config          pi settings, auth.json, extensions, gitconfig  (volume %s)\n' "$CONFIG_VOLUME" >&2
+    printf '  /pi-sessions        session files (*.jsonl) of the interactive agent  (volume %s)\n' "$1" >&2
+    [[ -n "${2:-}" ]] && printf '  /pi-sessions-runs   session files of `sapi run`  (volume %s)\n' "$2" >&2
+    printf '  /workspace          %s\n\n' "$WORKSPACE" >&2
+}
+
 cmd_shell() {
     require_docker
-    local name="${1:-}"
-    if [[ -z "$name" ]]; then
-        name="$(docker container ls --filter "label=$LABEL.workspace-hash=$WORKSPACE_HASH" --format '{{.Names}}' | head -n1)"
-        [[ -n "$name" ]] || die "no running container for $WORKSPACE"
+    local name="" net=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --net) net=1 ;;
+            -*) die "shell: unknown option $arg (options: --net)" ;;
+            *) name="$arg" ;;
+        esac
+    done
+    [[ -t 0 && -t 1 ]] || die "shell: an interactive terminal is required"
+
+    local ws; ws="$(sanitize "$(basename "$WORKSPACE")")"; ws="${ws:-workspace}"
+    local base="sapi-${ws:0:36}-${WORKSPACE_HASH:0:8}"
+    local runs="$base-runs-sessions"
+
+    # A running agent for this directory (or the named one): join it.
+    local running
+    if [[ -n "$name" ]]; then
+        running="$(docker container ls --filter "name=^${name}$" --filter "label=$LABEL.managed=true" --format '{{.Names}}' || true)"
+    else
+        running="$(docker container ls --filter "label=$LABEL.workspace-hash=$WORKSPACE_HASH" --filter "label=$LABEL.managed=true" --format '{{.Names}}' | grep -v -- '-egress$' | head -n1 || true)"
     fi
-    exec docker exec --interactive --tty --user "$UID_:$GID_" --env HOME=/home/sapi "$name" bash
+    if [[ -n "$running" ]]; then
+        log "shell: joining running container $running"
+        shell_banner "$(label "$running" sessions-volume)" ""
+        exec docker exec --interactive --tty --user "$UID_:$GID_" --env HOME=/home/sapi --workdir /pi-sessions "$running" bash
+    fi
+
+    # Nothing running: an ephemeral container with the same spec and volumes.
+    cmd_build
+    # A shell is not an agent: no sidecar, no self-update, hostname set.
+    SET_network=full; NETWORK_SIGNATURE=shell; AUTO_UPDATE_EFFECTIVE=0
+    local sessions="${name:-$base}-sessions"
+    docker volume inspect "$sessions" >/dev/null 2>&1 || log "shell: no sessions yet for ${name:-$WORKSPACE} (volume $sessions will be created)"
+    docker volume create "$CONFIG_VOLUME" >/dev/null
+    docker volume create "$sessions" >/dev/null
+    local -a args=() extra=()
+    local runs_mounted=""
+    while IFS= read -r line; do args+=("$line"); done < <(container_args "$base-shell-$$" "$sessions")
+    if docker volume inspect "$runs" >/dev/null 2>&1; then
+        extra+=(--mount "type=volume,source=$runs,target=/pi-sessions-runs"); runs_mounted="$runs"
+    fi
+    if (( net == 1 )); then log "shell: ephemeral container with network"; else extra+=(--network none); log "shell: ephemeral container, no network (--net to enable)"; fi
+    shell_banner "$sessions" "$runs_mounted"
+    exec docker run --rm --interactive --tty --label "$LABEL.shell=true" \
+        "${args[@]}" ${extra[@]+"${extra[@]}"} \
+        --env SAPI_CMD=bash --workdir /pi-sessions \
+        "$IMAGE"
 }
 
 cmd_upgrade() {
@@ -1007,7 +1070,7 @@ case "${1:-}" in
     build)      cmd_build ;;
     ls)         cmd_ls ;;
     rm)         cmd_rm "${2:-}" ;;
-    shell)      cmd_shell "${2:-}" ;;
+    shell)      shift; cmd_shell "$@" ;;
     netlog)     cmd_netlog "${2:-}" ;;
     upgrade)    cmd_upgrade ;;
     *)          [[ $# -eq 1 ]] || die "expected at most one container name (see sapi help)"

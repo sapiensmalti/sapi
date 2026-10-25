@@ -65,6 +65,9 @@ A typo in `~/.config/sapi/config`. Known keys: `safer`, `backup_dir`, `backup_ke
 **Backups are slow or large**
 They include everything, by design. Keep build output and `node_modules` out of directories you run sapi in, or accept the cost. `backup_keep` bounds how many are kept.
 
+**Where are the session files?**
+`sapi shell` puts you in `/pi-sessions` (interactive) with `/pi-sessions-runs` (headless runs) and `/pi-config` beside it. From the host, the Docker volumes are `sapi-<dir>-<hash>-sessions`, `…-runs-sessions` and `sapi-config`.
+
 **Still stuck**
 Run `sapi dockerfile` and `docker info`, and open an issue with the output and your OS.
 

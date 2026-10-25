@@ -136,6 +136,36 @@ check "full mode: no sidecar, hostname set"   bash -c "! grep -q -- --detach $ns
 check "egress image is pinned by digest"      bash -c "grep -q 'sapi-egress@sha256:[0-9a-f]\{64\}' $S && grep -q 'EGRESS_SOURCE_SHA256=\"[0-9a-f]\{64\}\"' $S"
 rm -rf "$nshim"
 
+echo "shell (docker shim)"
+sshim="$(mktemp -d)"
+cat >"$sshim/docker" <<SS
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> $sshim/calls
+case "\$1" in
+  info|image) exit 0 ;;
+  volume) [[ "\$2" == inspect && "\$*" == *runs-sessions* ]] && exit "\${RUNS_EXIST_RC:-1}"; echo v; exit 0 ;;
+  container) if [[ "\$2" == ls ]]; then printf '%s' "\${RUNNING:-}"; exit 0; fi; [[ "\$*" == *sessions-volume* ]] && echo somevol; exit 0 ;;
+  exec|run) exit 0 ;;
+  *) exit 0 ;;
+esac
+SS
+chmod +x "$sshim/docker"
+shell_run() { : >"$sshim/calls"; (cd "$proj" && env "$@" PATH="$sshim:$PATH" script -qc "$S shell ${SHELL_ARGS:-}" /dev/null >/dev/null 2>&1); true; }
+shell_run
+check "ephemeral shell when nothing runs"      bash -c "grep -q '^run ' $sshim/calls && ! grep -q '^exec ' $sshim/calls"
+check "shell lands in /pi-sessions via the entrypoint (SAPI_CMD=bash)" bash -c "l=\$(grep '^run ' $sshim/calls); [[ \$l == *'SAPI_CMD=bash'* ]] && [[ \$(grep -o -- '--workdir [^ ]*' <<<\"\$l\" | tail -1) == '--workdir /pi-sessions' ]]"
+check "ephemeral shell is hardened and removed"   bash -c "l=\$(grep '^run ' $sshim/calls); [[ \$l == *'--rm'* && \$l == *'--cap-drop ALL'* && \$l == *'no-new-privileges'* && \$l == *'SAPI_AUTO_UPDATE=0'* ]]"
+check "ephemeral shell has no network by default" bash -c "grep '^run ' $sshim/calls | grep -q -- '--network none'"
+check "no runs volume → not mounted"            bash -c "! grep '^run ' $sshim/calls | grep -q pi-sessions-runs"
+SHELL_ARGS=--net shell_run RUNS_EXIST_RC=0
+check "--net enables network"                   bash -c "! grep '^run ' $sshim/calls | grep -q -- '--network none'"
+check "runs volume mounted when present"        bash -c "grep '^run ' $sshim/calls | grep -q 'target=/pi-sessions-runs'"
+SHELL_ARGS="" shell_run RUNNING=sapi-proj-x
+check "running agent → exec into it, in /pi-sessions, as the user" bash -c "l=\$(grep '^exec ' $sshim/calls); [[ \$l == *'--workdir /pi-sessions'* && \$l == *'--user '* && \$l == *' sapi-proj-x bash'* ]] && ! grep -q '^run ' $sshim/calls"
+check "shell rejects unknown options"           bash -c "cd $proj && ! PATH=$sshim:\$PATH $S shell --bogus 2>/dev/null"
+check "entrypoint honours SAPI_CMD and skips update for shells" bash -c "cd $proj && $S dockerfile | grep -q 'cmd=\"\${SAPI_CMD:-pi}\"' && $S dockerfile | grep -q '\[ \"\$cmd\" = \"pi\" \] && \[ \"\${SAPI_AUTO_UPDATE:-1}\" = \"1\" \]'"
+rm -rf "$sshim"
+
 echo "diff / selective restore"
 rm -rf "$HOME/.local/share/sapi"; echo hello >"$proj/a.txt"; echo keep >"$proj/c.txt"
 (cd "$proj" && "$S" backup >/dev/null 2>&1)

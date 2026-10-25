@@ -118,6 +118,17 @@ grep -q "run: exit" /tmp/net.err && ok "sapi run in allowlist mode completes" ||
 rm -rf "$proj"
 docker rm -f smoke-egress >/dev/null 2>&1; docker image rm -f sapi-egress:smoke >/dev/null 2>&1 || true
 
+echo "shell (real container)"
+# `sapi shell` needs a TTY; exercise the same path the launcher uses: the image entrypoint with SAPI_CMD=bash.
+uidargs=(); [[ "$(uname -s)" == Linux ]] && uidargs=(-e "SAPI_UID=$(id -u)" -e "SAPI_GID=$(id -g)")
+out="$(docker run --rm --network none --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
+    -v smoke-shell-cfg:/pi-config -v smoke-shell-sess:/pi-sessions -e SAPI_CMD=bash -e SAPI_AUTO_UPDATE=1 "${uidargs[@]}" --workdir /pi-sessions "$SAPI_IMAGE" -c 'pwd; id -u; touch probe && stat -c %u probe' 2>&1)"
+[[ "$(sed -n 1p <<<"$out")" == /pi-sessions ]] && ok "shell starts in /pi-sessions" || bad "shell cwd: $out"
+if [[ "$(uname -s)" == Linux ]]; then
+    [[ "$(sed -n 2p <<<"$out")" == "$(id -u)" && "$(sed -n 3p <<<"$out")" == "$(id -u)" ]] && ok "shell runs as the host user and can write the sessions volume" || bad "shell uid: $out"
+fi
+docker volume rm smoke-shell-cfg smoke-shell-sess >/dev/null 2>&1 || true
+
 echo "sapi run (real container)"
 proj="$(mktemp -d)"; echo hello >"$proj/a.txt"
 set +e

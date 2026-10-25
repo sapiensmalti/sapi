@@ -114,6 +114,7 @@ What exists the next morning, for that one run, all outside the agent's reach:
 | `cron.log` (stdout + stderr) | *What did it say?* — its final message, plus sapi's own lines |
 | `sapi diff <stamp>.tar.gz` | *What did it actually change?* — every path, with hunks on request |
 | `sapi restore <stamp>.tar.gz --files …` | *Undo exactly that* — one file or the whole tree, without touching anything else |
+| `sapi shell` → `/pi-sessions-runs/*.jsonl` | *Every message, tool call and result of the run* — pi's own session file, in a shell with no network |
 
 Each night's run gets its own backup, so the chain of backups is a chain of before-states; `backup_keep` bounds how far back it reaches. This is auditability (every input and output of the run is recorded, independently of the agent and independently of git) and reversibility (any subset of its effects can be undone, verified against a checksum) — with zero cooperation required from the agent, the model, or the repository.
 
@@ -146,3 +147,18 @@ Rules: `key = value`, `#` comments, lower-case keys (`sapi config keys` lists th
 - **Secrets travel with it.** The archive contains whatever the directory contains. It is `0600` in a `0700` folder; it is not encrypted.
 - **Not off-site.** The backup lives on the same machine. It protects against the agent, not against the disk.
 - **`diff` extracts the backup** to a private temporary directory to compare; for very large trees that costs time and `$TMPDIR` space.
+
+## `sapi shell`: where pi keeps its files
+
+```
+$ sapi shell
+  /pi-config          pi settings, auth.json, extensions, gitconfig  (volume sapi-config)
+  /pi-sessions        session files (*.jsonl) of the interactive agent  (volume sapi-<dir>-<hash>-sessions)
+  /pi-sessions-runs   session files of `sapi run`  (volume sapi-<dir>-<hash>-runs-sessions)
+  /workspace          /home/you/code/project
+sapi@sapi:/pi-sessions$ ls -t | head
+```
+
+One command, no prerequisites. If an agent for this directory is running you are placed inside it; otherwise an ephemeral container with the same hardening and the same volumes is started — and removed when you leave. Ephemeral shells have **no network** unless you pass `--net`: a shell with the credentials volume mounted should not have egress by accident. On Linux the shell runs as your uid, like the agent, so anything you create is yours. `sapi shell NAME` targets a specific container's sessions.
+
+Session files are pi's own record of every message, tool call and result — the finest-grained audit trail there is. `jq -c 'select(.type == "message_end") | .message.role' *.jsonl` is a good first look; see pi's [session format](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/session-format.md).

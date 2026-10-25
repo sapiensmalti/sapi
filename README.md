@@ -64,6 +64,7 @@ sapi diff            what changed since the backup (A/M/D per path; --full for h
 sapi restore latest --files PATH…   put back just those files · sapi restore latest → whole tree beside the original
 sapi backups         list this directory's backups
 sapi config          show or set persistent settings
+sapi shell           a shell in /pi-sessions (session files) with /pi-config beside it; --net for network
 sapi ls              list sapi containers
 sapi rm [--all]      remove this directory's containers (or all)
 sapi shell [NAME]    bash inside the running container
