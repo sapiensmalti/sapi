@@ -86,8 +86,12 @@ if (( fail > 0 )); then
     echo "--- diagnostics"
     echo "curl:"; agent curl -sS -m 10 -v https://api.github.com/ 2>&1 | tail -n 8 || true
     echo "getent:"; agent bash -c 'getent hosts api.github.com; cat /etc/resolv.conf' 2>&1 || true
-    echo "iptables (filter):"; docker exec -u 0 smoke-egress iptables -S 2>&1 || true
-    echo "iptables (nat):"; docker exec -u 0 smoke-egress iptables -t nat -S 2>&1 || true
+    echo "iptables counters (filter):"; docker exec -u 0 smoke-egress iptables -L -v -n -x 2>&1 || true
+    echo "iptables counters (nat):"; docker exec -u 0 smoke-egress iptables -t nat -L OUTPUT -v -n -x 2>&1 || true
+    echo "direct udp to listener (bypassing nat):"; agent bash -c 'printf "\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x03api\\x06github\\x03com\\x00\\x00\\x01\\x00\\x01" > /dev/udp/127.0.0.1/15053; sleep 1' 2>&1 || true; docker logs smoke-egress 2>&1 | grep -c dns || true
+    echo "direct tcp to tls listener:"; agent bash -c 'exec 3<>/dev/tcp/127.0.0.1/15443 && echo connected' 2>&1 || true
+    echo "sysctls:"; docker exec -u 0 smoke-egress sh -c 'sysctl net.ipv4.conf.all.route_localnet net.ipv4.conf.lo.rp_filter net.ipv4.conf.all.rp_filter 2>&1' || true
+    echo "nft ruleset:"; docker exec -u 0 smoke-egress sh -c 'apk add -q nftables >/dev/null 2>&1; nft list ruleset 2>&1 | head -n 60' || true
     echo "iptables backend:"; docker exec -u 0 smoke-egress iptables -V 2>&1 || true
     echo "listeners:"; docker exec -u 0 smoke-egress netstat -tulpn 2>&1 | head -n 10 || docker exec -u 0 smoke-egress cat /proc/net/tcp 2>&1 | head -n 5 || true
     echo "sidecar log:"; docker logs smoke-egress 2>&1 | tail -n 5
