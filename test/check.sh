@@ -8,7 +8,12 @@ cd "$(dirname "$0")/.."
 pass=0; fail=0
 ok()   { pass=$((pass + 1)); printf '  ok   %s\n' "$*"; }
 bad()  { fail=$((fail + 1)); printf '  FAIL %s\n' "$*" >&2; }
-check() { local msg="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$msg"; else bad "$msg"; fi; }
+check() {
+    local msg="$1"; shift
+    if [[ "${DEBUG:-0}" == 1 ]]; then
+        if "$@"; then ok "$msg"; else bad "$msg"; fi
+    elif "$@" >/dev/null 2>&1; then ok "$msg"; else bad "$msg"; fi
+}
 stat_mode() { if stat -c %a / >/dev/null 2>&1; then stat -c %a -- "$1"; else stat -f %Lp "$1"; fi; }
 checksum() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi; }
 SCRIPT_KIND=bsd
@@ -113,14 +118,14 @@ check "refuses symlinked dir inside workspace" bash -c "ln -s $proj $HOME/plink 
 check "refuses to back up /"         bash -c "cd / && ! $S backup"
 shim="$(mktemp -d)"; real_tar="$(command -v tar)"
 printf '#!/bin/sh\ncase "$1" in -czf) echo boom >&2; exit 2;; esac\nexec %s "$@"\n' "$real_tar" >"$shim/tar"; chmod +x "$shim/tar"
-n_before="$(cd "$proj" && "$S" backups | wc -l)"
-check "fatal tar aborts, leaves no archive or partial" bash -c "cd $proj && ! PATH=$shim:\$PATH $S backup && [[ \$($S backups | wc -l) == $n_before ]] && [[ -z \$(find $HOME/.local/share/sapi -name '*.partial') ]]"
+n_before="$(cd "$proj" && "$S" backups | wc -l | tr -d ' ')"
+check "fatal tar aborts, leaves no archive or partial" bash -xc "cd $proj && ! PATH=$shim:\$PATH $S backup && [[ \$($S backups | wc -l | tr -d ' ') == $n_before ]] && [[ -z \$(find $HOME/.local/share/sapi -name '*.partial') ]]"
 printf '#!/bin/sh\ncase "$1" in -czf) %s "$@"; exit 1;; esac\nexec %s "$@"\n' "$real_tar" "$real_tar" >"$shim/tar"
 check "tar exit 1 keeps the archive and records it" bash -c "cd $proj && b2=\$(PATH=$shim:\$PATH $S backup 2>/dev/null) && grep -qx 'tar_exit = 1' \$b2.manifest"
 printf '#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted"\necho "x 1 1 1 1 /"\n' >"$shim/df"; chmod +x "$shim/df"
 check "insufficient space aborts"    bash -c "cd $proj && ! PATH=$shim:\$PATH $S backup"
-check "prunes to backup_keep"        bash -c "cd $proj && for i in 1 2 3 4; do sleep 1; SAPI_BACKUP_KEEP=2 $S backup >/dev/null 2>&1; done; [[ \$($S backups | wc -l) == 2 ]] && [[ \$(ls '$(dirname "$b")' | wc -l) == 6 ]]"
-check "backup_keep=0 keeps all"      bash -c "cd $proj && SAPI_BACKUP_KEEP=0 $S backup >/dev/null 2>&1 && [[ \$($S backups | wc -l) == 3 ]]"
+check "prunes to backup_keep"        bash -c "cd $proj && for i in 1 2 3 4; do sleep 1; SAPI_BACKUP_KEEP=2 $S backup >/dev/null 2>&1; done; [[ \$($S backups | wc -l | tr -d ' ') == 2 ]] && [[ \$(ls '$(dirname "$b")' | wc -l | tr -d ' ') == 6 ]]"
+check "backup_keep=0 keeps all"      bash -c "cd $proj && SAPI_BACKUP_KEEP=0 $S backup >/dev/null 2>&1 && [[ \$($S backups | wc -l | tr -d ' ') == 3 ]]"
 backup_root="$(dirname "$b")"
 check "a live backup lock refuses a concurrent writer" bash -c "mkdir $backup_root/.backup.lock; echo \$\$ >$backup_root/.backup.lock/pid; cd $proj && ! $S backup >/dev/null 2>&1; rc=\$?; rmdir_lock=\$(cat $backup_root/.backup.lock/pid); rm -rf $backup_root/.backup.lock; [[ \$rc == 0 && \$rmdir_lock == \$\$ ]]"
 check "a stale backup lock is recovered" bash -c "mkdir $backup_root/.backup.lock; echo 99999999 >$backup_root/.backup.lock/pid; cd $proj && $S backup >/dev/null 2>&1 && [[ ! -e $backup_root/.backup.lock ]]"
