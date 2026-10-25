@@ -8,7 +8,7 @@
 set -Eeuo pipefail
 
 REPO="${SAPI_REPO:-sapiensmalti/sapi}"
-REF="${SAPI_REF:-main}" # RELEASE_PIN
+REF="${SAPI_REF:-v0.6.1}"
 DIR="${SAPI_INSTALL_DIR:-$HOME/.local/bin}"
 URL="${SAPI_URL:-https://raw.githubusercontent.com/$REPO/$REF/sapi}"
 
