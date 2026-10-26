@@ -88,16 +88,17 @@ readonly DOCKERFILE
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-die() { printf 'sapi: %s\n' "$*" >&2; exit 1; }
+ERROR_STATUS=1
+die() { printf 'sapi: %s\n' "$*" >&2; exit "$ERROR_STATUS"; }
 log() { printf 'sapi: %s\n' "$*" >&2; }
 
 # One exit hook for every transient resource; each is a no-op until set.
-BACKUP_PARTIAL=""; BACKUP_TXN=""; BACKUP_LOCK=""; DIFF_TMP=""
-RESTORE_TMP=""; RESTORE_TXN=""; RESTORE_DEST=""
+BACKUP_PARTIAL=""; BACKUP_TXN=""; BACKUP_LOCK=""; BACKUP_REAP=""; DIFF_TMP=""
+RESTORE_TMP=""; RESTORE_TXN=""; RESTORE_DEST=""; RESTORE_COMMITTED=0
 EGRESS_STOP_NAME=""; RUN_STOP_NAME=""; RUN_TIMER_PID=""; RUN_TMP=""
 on_exit() {
     local rc=$?
-    trap - EXIT
+    trap - EXIT ERR
     set +e
     [[ -n "$RUN_TIMER_PID" ]] && { kill "$RUN_TIMER_PID" 2>/dev/null; wait "$RUN_TIMER_PID" 2>/dev/null; }
     [[ -n "$RUN_STOP_NAME" ]] && docker rm --force "$RUN_STOP_NAME" >/dev/null 2>&1
@@ -105,10 +106,17 @@ on_exit() {
     [[ -n "$BACKUP_PARTIAL" ]] && rm -f -- "$BACKUP_PARTIAL"
     [[ -n "$BACKUP_TXN" ]] && rm -rf -- "$BACKUP_TXN"
     [[ -n "$BACKUP_LOCK" ]] && { rm -f -- "$BACKUP_LOCK/pid"; rmdir -- "$BACKUP_LOCK" 2>/dev/null; }
+    [[ -n "$BACKUP_REAP" ]] && rmdir -- "$BACKUP_REAP" 2>/dev/null
     [[ -n "$DIFF_TMP" ]] && rm -rf -- "$DIFF_TMP"
-    if [[ -n "$RESTORE_TXN" && -n "$RESTORE_DEST" && ( -e "$RESTORE_TXN/old" || -L "$RESTORE_TXN/old" ) ]] \
-        && [[ ! -e "$RESTORE_DEST" && ! -L "$RESTORE_DEST" ]]; then
-        mv -- "$RESTORE_TXN/old" "$RESTORE_DEST" 2>/dev/null
+    if [[ -n "$RESTORE_TXN" && -n "$RESTORE_DEST" && "$RESTORE_COMMITTED" == 0 \
+        && ( -e "$RESTORE_TXN/old" || -L "$RESTORE_TXN/old" ) ]]; then
+        if [[ ! -e "$RESTORE_DEST" && ! -L "$RESTORE_DEST" ]] \
+            && mv -- "$RESTORE_TXN/old" "$RESTORE_DEST" 2>/dev/null; then
+            : # Original is back in place; the transaction can be discarded.
+        else
+            log "restore: rollback incomplete; original preserved at $RESTORE_TXN/old"
+            RESTORE_TXN="" # Never delete the only saved original on a failed rollback.
+        fi
     fi
     [[ -n "$RESTORE_TXN" ]] && rm -rf -- "$RESTORE_TXN"
     [[ -n "$RESTORE_TMP" ]] && rm -rf -- "$RESTORE_TMP"
@@ -594,18 +602,34 @@ cmd_config() {
 backup_root() { printf '%s/%s-%s' "$BACKUP_DIR" "$(sanitize "$(basename "$WORKSPACE")")" "${WORKSPACE_HASH:0:8}"; }
 
 backup_lock_acquire() { # mkdir is the portable atomic lock (no flock on macOS)
-    local root="$1" lock="$1/.backup.lock" pid=""
+    local lock="$1/.backup.lock" reap="$1/.backup.reap" pid="" current=""
     if ! (umask 077 && mkdir "$lock") 2>/dev/null; then
         [[ -f "$lock/pid" ]] && pid="$(cat "$lock/pid")"
-        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        # mkdir and PID publication are separate operations. Missing/invalid
+        # ownership may mean a live creator; it is never proof of a stale lock.
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] \
+            || die "backup: incomplete lock $lock; retry, or inspect it if no backup is running"
+        if kill -0 "$pid" 2>/dev/null; then
             die "backup: another backup for this directory is in progress (pid $pid)"
         fi
+        # Serialize stale-owner recovery, then recheck ownership. Otherwise
+        # two reapers can remove a new writer's lock using an old PID read.
+        (umask 077 && mkdir "$reap") 2>/dev/null \
+            || die "backup: lock recovery busy or interrupted; inspect $reap if no backup is running"
+        BACKUP_REAP="$reap"
+        [[ -f "$lock/pid" ]] && current="$(cat "$lock/pid")"
+        [[ "$current" == "$pid" ]] || die "backup: lock owner changed; retry"
+        kill -0 "$current" 2>/dev/null && die "backup: lock owner is still running (pid $current)"
         log "backup: removing stale lock $lock"
-        rm -rf -- "$lock"
-        (umask 077 && mkdir "$lock") || die "backup: cannot acquire $lock"
+        rm -- "$lock/pid" && rmdir -- "$lock" || die "backup: cannot remove stale lock $lock"
+        (umask 077 && mkdir "$lock") || die "backup: another writer acquired $lock; retry"
     fi
-    (umask 077 && printf '%s\n' "$$" >"$lock/pid") || die "backup: cannot write $lock/pid"
     BACKUP_LOCK="$lock"
+    (umask 077 && printf '%s\n' "$$" >"$lock/pid") || die "backup: cannot write $lock/pid"
+    if [[ -n "$BACKUP_REAP" ]]; then
+        rmdir -- "$BACKUP_REAP" || die "backup: cannot release $BACKUP_REAP"
+        BACKUP_REAP=""
+    fi
 }
 
 backup_lock_release() {
@@ -736,13 +760,12 @@ archive_inspect() { # $1 archive, $2 listing output; sets ARCHIVE_TOP
 
 # Copy one staged path into the workspace without following any symlink in
 # its destination parents. The new item is complete before the old one is
-# moved; on an ordinary error or signal the old item is put back.
+# moved; on an error or caught signal, roll back or preserve the saved original.
 restore_one() { # $1 staged source, $2 relative destination
-    local src="$1" rel="$2" parent="$WORKSPACE" parent_rel="" part dest txn had=0
+    local src="$1" rel="$2" parent="$WORKSPACE" parent_rel="" part dest txn
     local -a parts=()
     [[ "$rel" == */* ]] && parent_rel="${rel%/*}"
-    local IFS='/'
-    read -r -a parts <<< "$parent_rel"
+    IFS='/' read -r -d '' -a parts < <(printf '%s\0' "$parent_rel")
     for part in ${parts[@]+"${parts[@]}"}; do
         [[ -z "$part" || "$part" == . ]] && continue
         parent="$parent/$part"
@@ -755,16 +778,14 @@ restore_one() { # $1 staged source, $2 relative destination
     done
     dest="$WORKSPACE/$rel"
     txn="$(umask 077 && mktemp -d "$parent/.sapi-restore.XXXXXX")" || die "restore: cannot stage beside $dest"
-    RESTORE_TXN="$txn"; RESTORE_DEST="$dest"
+    RESTORE_TXN="$txn"; RESTORE_DEST="$dest"; RESTORE_COMMITTED=0
     cp -Rp -- "$src" "$txn/item" || die "restore: could not stage $rel"
     if [[ -e "$dest" || -L "$dest" ]]; then
         mv -- "$dest" "$txn/old" || die "restore: could not set aside $dest"
-        had=1
     fi
-    if ! mv -- "$txn/item" "$dest"; then
-        (( had == 1 )) && mv -- "$txn/old" "$dest" 2>/dev/null
-        die "restore: could not replace $dest"
-    fi
+    # Rollback belongs to the exit hook, including errors and caught signals.
+    mv -- "$txn/item" "$dest" || die "restore: could not replace $dest"
+    RESTORE_COMMITTED=1
     rm -rf -- "$txn"
     RESTORE_TXN=""; RESTORE_DEST=""
 }
@@ -796,9 +817,8 @@ cmd_restore() {
             while [[ "$p" == ./* ]]; do p="${p#./}"; done
             while [[ "$p" == */ ]]; do p="${p%/}"; done
             [[ -n "$p" && "$p" != . && "$p" != /* ]] || die "restore: paths must name an item inside the directory"
-            local IFS='/'
             local -a components=()
-            read -r -a components <<< "$p"
+            IFS='/' read -r -d '' -a components < <(printf '%s\0' "$p")
             for component in ${components[@]+"${components[@]}"}; do
                 [[ "$component" != .. ]] || die "restore: paths must stay inside the directory: $p"
             done
@@ -1298,8 +1318,11 @@ tree_manifest() { # $1 root, $2 output
         key="$(path_key "$rel")"
         raw="$(printf '%s' "$rel" | base64 | tr -d '\r\n')" || die "diff: cannot encode a path"
         if [[ -L "$absolute" ]]; then
-            target="$(readlink "$absolute")" || die "diff: cannot read link $rel"
-            meta="link:$(path_key "$target")"
+            # A sentinel preserves trailing target newlines in command
+            # substitution; strip only it and readlink's own final newline.
+            target="$(readlink "$absolute" && printf .)" || die "diff: cannot read link $rel"
+            target="${target%.}"
+            meta="link:$(path_key "${target%$'\n'}")"
         elif [[ -d "$absolute" ]]; then
             mode="$(file_mode "$absolute")" && meta="dir:$mode" || die "diff: cannot stat $rel"
         elif [[ -f "$absolute" ]]; then
@@ -1337,6 +1360,10 @@ emit_full_diff() { # $1 status, $2 display key, $3 base64 path
 }
 
 cmd_diff() {
+    # diff(1) contract: 1 means changes only; explicit and unexpected errors
+    # both return 2. This command exits explicitly after a complete comparison.
+    ERROR_STATUS=2
+    trap 'exit 2' ERR
     command -v base64 >/dev/null 2>&1 || die "diff: base64 is required"
     local file="" full=0 arg
     for arg in "$@"; do
@@ -1366,7 +1393,7 @@ cmd_diff() {
 
     local tab; tab="$(printf '\t')"
     awk -F '\t' '
-        NR == FNR { meta[$1] = $2; raw[$1] = $3; next }
+        FILENAME == ARGV[1] { meta[$1] = $2; raw[$1] = $3; next }
         {
             if ($1 in meta) {
                 if (meta[$1] != $2) print "M\t" $1 "\t" $3
@@ -1393,7 +1420,7 @@ cmd_diff() {
         done <"$tmp/changes"
     fi
     log "diff: $added added, $modified modified, $deleted deleted · vs $(basename "$file")$( [[ -f "$file.run" ]] && printf ' · run exit %s' "$(awk -F' = ' '$1 == "exit_code" {print $2}' "$file.run")")"
-    (( added + modified + deleted == 0 ))
+    exit "$(( added + modified + deleted > 0 ))"
 }
 
 # ---------------------------------------------------------------------------

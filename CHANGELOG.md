@@ -2,6 +2,14 @@
 
 All notable changes are recorded here. Versions follow [Semantic Versioning](https://semver.org/) while the CLI is pre-1.0.
 
+## Unreleased
+
+- Preserve saved originals if selective-restore rollback fails, the destination reappears, or a signal leaves the swap's commit uncertain; print the recovery path.
+- Refuse incomplete backup locks and serialize stale-owner recovery with an ownership recheck; never reclaim a lock merely because its PID has not been written yet.
+- Correct diff additions against empty backups, preserve trailing newlines in symlink targets, and return `2` for comparison errors (`1` remains changes only).
+- Preserve newline-containing parent components during selective restore; add deterministic recovery-failure and concurrency regression tests.
+- Clarify backup consistency limits, per-selection restore transactions, and interrupted-recovery instructions.
+
 ## [0.6.1] - 2026-10-25
 
 Security and correctness release; no new configuration is required.

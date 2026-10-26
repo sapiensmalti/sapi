@@ -281,7 +281,9 @@ echo one >"$proj/same-a"; cp "$proj/same-a" "$proj/same-b"; ln -sfn same-a "$pro
 (cd "$proj" && "$S" backup >/dev/null 2>&1)
 check "no changes → exit 0"            bash -c "cd $proj && $S diff 2>/dev/null"
 echo changed >"$proj/a.txt"; rm "$proj/c.txt"; echo new >"$proj/sub/n.txt"; mkdir -p "$proj/d"; echo x >"$proj/d/e.txt"
-out="$(cd "$proj" && "$S" diff 2>/dev/null)" && bad "diff exits 1 when there are changes" || ok "diff exits 1 when there are changes"
+diff_rc=0
+out="$(cd "$proj" && "$S" diff 2>/dev/null)" || diff_rc=$?
+check "diff exits 1 when there are changes" test "$diff_rc" -eq 1
 check "diff marks M"                   grep -qx "M  a.txt" <<<"$out"
 check "diff marks D"                   grep -qx "D  c.txt" <<<"$out"
 check "diff marks A (nested)"          grep -qx "A  sub/n.txt" <<<"$out"
@@ -333,6 +335,9 @@ check "run refuses an empty task"     bash -c "cd $proj && ! $S run '  ' 2>/dev/
 check "--safer run writes a run manifest next to the backup" bash -c "cd $proj && PATH=$rshim:\$PATH $S --safer run 'do it' >/dev/null 2>&1 && m=\$(ls $HOME/.local/share/sapi/backups/*/*.run | tail -1) && grep -qx 'task = do it' \$m && grep -qx 'exit_code = 0' \$m"
 rm -rf "$rshim"
 rm -rf "$HOME" "$shim"; HOME="$REAL_HOME"; unset SAPI_CONFIG_FILE
+
+echo "recovery failure paths"
+check "recovery regression suite (no Docker)" bash test/recovery.sh
 
 echo "hygiene"
 check "LICENSE present"              test -f LICENSE

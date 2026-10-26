@@ -25,8 +25,8 @@ AI coding agents run shell commands. Giving one your whole laptop is a bad trade
 - **One file.** `sapi` is a single bash script. The installer copies it to `~/.local/bin`. No sudo, no shell-profile edits, no daemons.
 - **One directory.** The only thing mounted from your machine is the directory you run `sapi` from.
 - **Your files stay yours.** On Linux the agent runs as *your* uid/gid, so nothing comes out root-owned.
-- **Recoverable by construction.** `sapi --safer` takes a complete, checksummed backup before every start — stored where the agent cannot reach it — and refuses to start if it cannot. `sapi diff` shows every path the agent changed; `sapi restore latest --files …` puts any of them back. The sandbox protects everything outside the directory; this protects the directory itself.
-- **A Unix command.** `sapi run TASK` runs one headless task: final message on stdout, the agent's exit code, `--timeout`. In a cron job with safer mode, every run leaves a backup, a run manifest and a diff behind — auditable and reversible without the agent's cooperation.
+- **Recoverable by construction.** `sapi --safer` takes a complete, checksummed backup before every start — stored where the agent cannot reach it — and refuses to start if it cannot. `sapi diff` shows paths that differ from the backup; `sapi restore latest --files …` puts any of them back. The sandbox protects everything outside the directory; this protects the directory itself.
+- **A Unix command.** `sapi run TASK` runs one headless task: final message on stdout, the agent's exit code, `--timeout`. In a cron job with safer mode, every run leaves a backup and a run manifest; `sapi diff` compares the current tree against that backup — auditable and reversible without the agent's cooperation.
 - **Your toolchain, your call.** `sapi config set packages "golang make"` or a `~/.config/sapi/Dockerfile.extra` extends the image; `sapi dockerfile` shows exactly what gets built. User-level only — a repository can never add a build step to your host.
 - **Egress allowlist, when you want it.** `sapi config set network allowlist`: a Rust sidecar owns the agent's network namespace — kernel-level redirection, fake DNS (no tunnelling), TLS-SNI and HTTP-Host filtering, connect-by-name. Only the hosts you list, on 80/443; everything else dropped and logged. Off by default.
 - **Persistent where it matters.** Credentials and settings live in one Docker volume; each project's sessions in another. Containers are disposable; `sapi` resumes or rebuilds them transparently.
@@ -135,7 +135,7 @@ The launcher is one readable file and stays that way; anything long-running or s
 - `sapi` — launcher, embedded Dockerfile and entrypoint
 - `install.sh` — installer
 - `egress/` — sidecar: `cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --all-features --locked && cargo deny check`
-- `test/check.sh` — lint and unit checks (no Docker; Linux + macOS)
+- `test/check.sh` — lint and unit checks, including `bash test/recovery.sh` for recovery failures and concurrency (no Docker; Linux + macOS)
 - `test/smoke.sh` — real image, container, restore, and firewall checks (Docker; Linux + macOS CI)
 
 Run both before opening a PR. Changes that add dependencies, touch the host outside `~/.local/bin`, or widen the container's access need a very good reason.

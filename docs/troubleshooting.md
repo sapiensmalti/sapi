@@ -66,7 +66,13 @@ A typo or invalid value in `~/.config/sapi/config`. `sapi config keys` lists eve
 They include everything, by design. Keep build output and `node_modules` out of directories you run sapi in, or accept the cost. `backup_keep` bounds how many are kept.
 
 **`sapi: backup: another backup … is in progress`**
-Another sapi process is archiving the same directory; wait for it. After a crash, a stale lock is recovered automatically. Never delete a lock whose pid is still running.
+Another sapi process is archiving the same directory; wait for it. A lock with a known-dead owner is recovered automatically. Never delete a lock whose pid is still running.
+
+**`sapi: backup: incomplete lock …` / `lock recovery busy or interrupted`**
+Retry first: another process may still be publishing its PID or recovering a stale lock. If the error persists, stop all backups for that project and inspect the printed `.backup.lock` / `.backup.reap` paths. Only after confirming no backup is running, remove the lock's `pid` file if present and remove the empty lock/recovery directories with `rmdir`. Do not recursively delete their parent: that is where the backups live.
+
+**`sapi: restore: rollback incomplete; original preserved at …`**
+The swap failed or was interrupted and the original could not safely be put back. Stop other writers, inspect the printed `old` path and the intended destination, then move the original back when safe. Do not remove `.sapi-restore.*` until its contents are recovered.
 
 **A directory restore removed a new file**
 `restore --files DIR` replaces the selected directory exactly as it was in the backup; additions beneath it are removed. Restore individual files when you need a merge, or whole-tree restore beside the original and compare first.

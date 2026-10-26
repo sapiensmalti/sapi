@@ -41,13 +41,13 @@ It is stored **outside** the directory, where the agent cannot reach it:
 
 ### How it is made
 
-1. **Preconditions**: `tar` exists; the directory is not `/`; the backup root is not inside the directory (checked textually *and* after resolving symlinks); its permissions are enforced to 0700; directory measurement and the free-space check must succeed. A portable `mkdir` lock refuses a concurrent backup for the same project and recovers stale locks.
+1. **Preconditions**: `tar` exists; the directory is not `/`; the backup root is not inside the directory (checked textually *and* after resolving symlinks); its permissions are enforced to 0700; directory measurement and the free-space check must succeed. A portable `mkdir` lock refuses a concurrent backup for the same project. Recovery of a known-dead owner is serialized and ownership rechecked; missing or malformed ownership fails closed ([troubleshooting](troubleshooting.md)).
 2. `tar -czf` into a private transaction directory. GNU tar's exit 1 ("file changed as we read it") is recorded as a warning in the manifest; anything worse aborts.
 3. The archive is re-read in full (`tar -tzf`) to prove it is readable and non-empty.
 4. SHA-256 and metadata are completely written, then the archive is renamed into place as the commit point. A crash can leave harmless orphan sidecars, cleaned by a later backup, never an apparently complete archive with half-written metadata.
 5. Backups beyond `backup_keep` (default 10; `0` = keep all) are pruned with their checksum/manifest/run sidecars, oldest first.
 
-On an ordinary error or signal, **the launch is aborted** and transaction/lock state is cleaned. (A power loss or `SIGKILL` cannot run cleanup; the next backup recovers it.) The container is created only after step 5, so what the agent sees is exactly what was archived.
+On an ordinary error or caught signal, **the launch is aborted** and cleanup is attempted. Power loss or `SIGKILL` cannot run cleanup; an incomplete lock or interrupted lock recovery may need inspection. The container is created only after step 5. This is not a filesystem snapshot: other programs can change the directory during archiving or before the agent starts.
 
 ## `sapi run`: headless
 
@@ -77,9 +77,9 @@ D  src/auth/legacy.ts
 sapi: diff: 1 added, 1 modified, 1 deleted · vs 20261025T074811Z.tar.gz · run exit 0
 ```
 
-Compares the directory **now** against the latest backup (or a given one: `sapi diff FILE`). If a checksum sidecar exists it must match; a missing one produces an explicit unverified-integrity warning. `--full` appends unified hunks for regular files (`--- backup/…`, `+++ now/…`). Exit status follows `diff(1)`: `0` no changes, `1` changes, `>1` trouble — so `sapi diff || notify` works.
+Compares the directory **now** against the latest backup (or a given one: `sapi diff FILE`). If a checksum sidecar exists it must match; a missing one produces an explicit unverified-integrity warning. `--full` appends unified hunks for regular files (`--- backup/…`, `+++ now/…`). Exit status follows `diff(1)`: `0` no changes, `1` changes, `2` error; caught signals retain their usual exit statuses. Automation can distinguish a changed tree from a failed comparison.
 
-The comparison uses private manifests of content hashes, file types, permission modes, and symlink targets. A chmod, type change, or same-content symlink retarget is therefore a modification. It never recursively follows symlinks, and unusual/control-character paths are escaped rather than interpreted.
+The comparison uses private manifests of content hashes, file types, permission modes, and symlink targets. A chmod, type change, or same-content symlink retarget is therefore a modification, including targets that differ only by trailing newlines. It never recursively follows symlinks, and unusual/control-character paths are escaped rather than interpreted.
 
 It needs no git. It works when the project is not a repository, when `.git` itself was deleted, and for files git would ignore.
 
@@ -92,9 +92,10 @@ sapi restore FILE /some/empty/dir                                   # whole tree
 ```
 
 - Restore verifies an available checksum and refuses a corrupt archive; missing/invalid metadata is never presented as verified. Archives must have one top-level directory and no absolute/parent-traversing members. **Restore only archives you trust: a checksum proves integrity, not authorship.**
-- **Whole-tree restore never writes into the original directory.** It stages a complete tree beside a new or empty destination and moves it into place; failure does not leave a half-extracted destination.
+- **Whole-tree restore defaults to a new sibling directory.** An explicit destination must be new or empty. It stages a complete tree beside the destination and moves it into place; failure does not leave a half-extracted destination.
 - **`--files` is the only in-place operation**, and it touches exactly the paths you name — relative, inside the directory, present in the backup; parent traversal and absolute paths are refused, while a name such as `a..b` is valid.
-- Each selected path is staged beside its destination and swapped in without following destination symlinks. **Selecting a directory replaces that directory exactly**: files created beneath it since the backup are removed. Unrelated paths are untouched.
+- Each selected path is staged beside its destination and swapped in without following destination symlinks. **Selecting a directory replaces that directory exactly**: files created beneath it since the backup are removed. Unrelated paths are untouched. Selections are processed in order, not as one transaction; an earlier successful selection remains restored if a later one fails.
+- On a failed swap or caught signal, sapi attempts to put the saved original back. If rollback fails or the destination has reappeared, it retains the original at `.sapi-restore.*/old` and prints its location. Inspect it before retrying; never delete that directory until the original is safe. Stop agents and other writers before restoring.
 - Everything is standard tar: you can inspect an archive with `tar -tzf FILE` without sapi.
 
 ## Unattended: auditable and reversible by construction
@@ -147,7 +148,7 @@ Rules: `key = value`, full-line `#` comments, lower-case keys (`sapi config keys
 ## Costs and limits
 
 - **Time and disk.** A backup of a directory with a large `node_modules` or build output takes as long as tarring it. Each run adds one archive; pruning bounds the count, not the size. Put `backup_dir` on a volume with room.
-- **Point in time, not crash-consistent.** Files written by other programs during the second or two of archiving may be captured mid-write. sapi reports this (`tar_exit = 1` in the manifest).
+- **Not a snapshot.** Concurrent writes can produce a mixed-time or mid-write backup. GNU tar may warn (`tar_exit = 1`), but cannot detect every change. Stop other writers when you need a stable tree; keep the directory still during diff or restore too.
 - **Secrets travel with it.** The archive contains whatever the directory contains. It is `0600` in a `0700` folder; it is not encrypted.
 - **Not off-site.** The backup lives on the same machine. It protects against the agent, not against the disk.
 - **`diff` extracts and hashes the backup and current tree** in private temporary storage; for very large trees that costs I/O and `$TMPDIR` space. Selective restore also stages the archive before swapping selected paths. `TMPDIR` must be outside the workspace.
