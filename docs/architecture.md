@@ -7,7 +7,7 @@
 | `install.sh` | Download, syntax-check, and atomically install the launcher. No Docker installation or privilege escalation. |
 | `sapi` | Single-file Bash launcher with the agent Dockerfile and entrypoint embedded. |
 | Agent image | Debian bookworm / Node 24, pi from npm, git, ripgrep, jq, curl, SSH client, and `uv`/`uvx`. Python can be provisioned by uv; it is not preinstalled by sapi. |
-| Entrypoint | Repair volume ownership, drop uid/capabilities, then attempt pi update and run pi or Bash. |
+| Entrypoint | Verify actual root identity, set a root environment, optionally update pi, then exec pi or Bash without dropping identity. |
 | `egress/` | Optional Rust sidecar for namespace firewall, local DNS responses, and hostname-filtered relays. |
 
 Only the launcher and its Dockerfiles are embedded in one file. The sidecar is a separate image/binary with its own source and tests. Bash orchestrates Docker; Rust handles the long-running network service. No component needs a Docker socket inside the agent container.
@@ -46,9 +46,9 @@ Sapi starts pi with `--continue`. This continues the slot's most recent stored s
 
 ## Entrypoint and other commands
 
-The privileged bootstrap repairs ownership of config/session/home directories, then `setpriv` switches to a non-root uid/gid, clears supplementary groups and inheritable/ambient capabilities, and sets no-new-privileges. Both Linux and macOS default to the host uid/gid. UID 0 is refused, including at the image entrypoint.
+The Dockerfile explicitly sets `USER 0:0`, including after user fragments. The launcher appends `--user 0:0`, a private cgroup namespace, the root-checking entrypoint, and zero identity environment values after extra Docker arguments. Resume requires matching policy/settings and actual Docker `Config.User` of `0:0`. Shell exec also explicitly selects `0:0`.
 
-Pi is installed under `/opt/pi`. Update-enabled agents also receive ownership of that npm prefix; trusted bootstrap files remain root-owned. Only after privilege dropping does the entrypoint run `pi update self --no-approve`, with failure logged and startup continued. The launcher skips it in allowlist mode without `@npm`; Bash shells skip it. No pi code or extensions execute during privileged setup. See [security](security.md).
+The entrypoint checks real/effective root credentials and sets `HOME=/root`, `USER=root`, and `LOGNAME=root`. Pi is installed under `/opt/pi`; pi updates, extensions, and the agent all execute as container root. Update failure is logged and startup continues. The launcher skips updates in allowlist mode without `@npm`; Bash shells skip them. Sapi does not chown the host workspace to disguise root-created files. See [security](security.md).
 
 `container_args` produces the shared Bash array of mounts, environment, labels, and hardening flags used by interactive agents, headless tasks, and temporary shells. Config parsing accepts only known keys and does not execute shell code; see [configuration](configuration.md).
 
@@ -59,6 +59,6 @@ Pi is installed under `/opt/pi`. Update-enabled agents also receive ownership of
 
 ## Allowlist sidecar
 
-The agent joins the sidecar's network namespace with `--network container:NAME-egress`. The sidecar installs default-drop rules, binds its listeners, drops privileges, then writes readiness on a fresh `/run` tmpfs. The launcher waits for that file. Production images are digest-pinned and exclude test-only bypass flags; local source builds use a checksum-pinned archive.
+The root agent joins the sidecar's network namespace with `--network container:NAME-egress`, but remains in a separate cgroup. Firewall exemptions match only the proxy cgroup, never its uid. The sidecar uses `--cgroupns host`, rejects an ambiguous/root cgroup path, installs default-drop rules, binds listeners, drops its own privileges, and writes a `cgroup-v2` readiness marker on a fresh `/run` tmpfs. The launcher rejects legacy readiness markers. Production images are digest-pinned and exclude test-only bypass flags; local source builds use a checksum-pinned archive.
 
 The runtime allowlist does not cover Docker's build/pull traffic. Enforcement, logging limits, and provider presets are in [network](network.md); backup/session behavior is in [recovery](recovery.md).

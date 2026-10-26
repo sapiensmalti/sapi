@@ -24,7 +24,7 @@ ENV PAGER=less
 
 If the file exists it is appended verbatim after the packages layer. Another path: `sapi config set dockerfile_extra /path` or `SAPI_DOCKERFILE_EXTRA`.
 
-Do not set `USER`: the entrypoint needs to start as root to repair volume ownership and switch to the configured uid. Install tools and their supporting files in locations accessible to that uid, not only under `/root`. For example, moving rustup's command shims alone does not move its toolchains. Fragments can execute arbitrary build steps; review them before use.
+The agent is always launched as root. Sapi appends `USER 0:0` after fragments and enforces it again at runtime; a fragment cannot select a different agent user. Tools under `/root` are available to the root agent, but container-local installations disappear when the container is replaced. For persistent tool availability, bake the full installation into the image. Fragments can execute arbitrary build steps; review them before use.
 
 ## How caching works
 
@@ -41,5 +41,5 @@ If you work on projects with very different needs, keep fragments per project in
 ## Troubleshooting
 
 - **Build fails on a package name** — `apt-cache search NAME` in a Debian bookworm container, or check [packages.debian.org](https://packages.debian.org/bookworm/). sapi validates the *shape* of names, not their existence.
-- **Tool installed but "not found" inside the agent** — it was installed into `/root`; on Linux the agent runs as your uid with `HOME=/home/sapi`. Install to `/usr/local/bin` or set `PATH` with `ENV`.
+- **Tool installed but "not found" inside the agent** — check `PATH` and whether the tool was installed only in a previous container's writable layer. Root uses `HOME=/root`; bake persistent tools into the image.
 - **Image rebuilt unexpectedly** — something in the effective Dockerfile changed (`sapi dockerfile`), or `SAPI_PI_VERSION` did.

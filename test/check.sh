@@ -2,8 +2,8 @@
 # Portable Linux/macOS lint and unit checks. No Docker required.
 # The linter is optional locally and mandatory in CI.
 set -Eeuo pipefail
-# Docker-backed behavior is shimmed here; never depend on a root CI user's uid.
-export SAPI_UID=1234 SAPI_GID=1234
+# Every managed agent is root, independently of the host/CI user.
+export SAPI_UID=0 SAPI_GID=0
 [[ "${DEBUG:-0}" == 1 ]] && set -x
 cd "$(dirname "$0")/.."
 
@@ -162,7 +162,9 @@ cat >"$nshim/docker" <<NS
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> $nshim/calls
 case "\$1" in
-  info|image|exec|stop) exit 0 ;;
+  exec) [[ "\${OLD_SIDECAR:-0}" == 1 && "\$*" == *cgroup-v2* ]] && exit 1; exit 0 ;;
+  info) [[ "\$*" == *CgroupVersion* ]] && printf '%s\\n' "\${CGROUP_INFO:-2 systemd}"; exit 0 ;;
+  image|stop) exit 0 ;;
   volume) echo v ;;
   container) case "\$2" in inspect) [[ "\$*" == *".State.Running"* ]] && echo true || exit 1 ;; *) exit 0 ;; esac ;;
   run) [[ "\$*" == *--detach* ]] && { echo id; exit 0; }; echo "Answer"; exit 0 ;;
@@ -179,8 +181,14 @@ check "agent shares the sidecar namespace, no hostname" bash -c "l=\$(grep '^run
 check "agent never gets the docker socket or NET_ADMIN" bash -c "! grep '^run --rm' $nshim/calls | grep -qE 'docker.sock|NET_ADMIN'"
 check "sidecar is removed after the run"      bash -c "tail -n1 $nshim/calls | grep -q '^rm --force .*-egress'"
 : >"$nshim/calls"
-check "agent uid cannot inherit the proxy firewall exemption" bash -c "cd $proj && ! SAPI_UID=65532 SAPI_NETWORK=allowlist PATH=$nshim:\$PATH $S run x >/dev/null 2>&1"
-check "uid collision fails before any sidecar starts" bash -c "! grep -q -- --detach $nshim/calls"
+check "non-root identity overrides are refused" bash -c "cd $proj && ! SAPI_UID=65532 SAPI_NETWORK=allowlist PATH=$nshim:\$PATH $S run x >/dev/null 2>&1"
+check "non-root override fails before any sidecar starts" bash -c "! grep -q -- --detach $nshim/calls"
+check "legacy UID-exempt sidecar cannot start a root agent" bash -c "cd $proj && ! OLD_SIDECAR=1 SAPI_NETWORK=allowlist PATH=$nshim:\$PATH $S run x >/dev/null 2>$nshim/err"
+check "legacy policy failure is diagnosed" grep -q 'obsolete/unsafe policy' "$nshim/err"
+check "legacy sidecar never launches the root agent" bash -c "! grep -q '^run --rm' $nshim/calls"
+: >"$nshim/calls"
+check "missing per-container cgroups fails closed" bash -c "cd $proj && ! CGROUP_INFO='2 none' SAPI_NETWORK=allowlist PATH=$nshim:\$PATH $S run x >/dev/null 2>$nshim/err"
+check "unsupported cgroups do not start any sidecar" bash -c "! grep -q -- --detach $nshim/calls"
 run_net SAPI_NETWORK=allowlist SAPI_ALLOW="@providers @github"
 check "self-update skipped without @npm"      bash -c "grep '^run --rm' $nshim/calls | grep -q 'SAPI_AUTO_UPDATE=0' && grep -q 'skipping pi self-update' $nshim/err"
 run_net SAPI_NETWORK=allowlist SAPI_ALLOW="@providers @npm"
@@ -207,6 +215,7 @@ case "\$1" in
         case "\$fmt" in
           *State.Status*) echo exited; exit 0 ;;
           *.Image*) echo image-id; exit 0 ;;
+          *Config.User*) echo "\${STORED_USER:-0:0}"; exit 0 ;;
           *Config.Labels*)
             key="\${fmt#*\"}"; key="\${key%%\"*}"; file="\$(printf '%s' "\$key" | tr . _)"
             [[ -f "\$state/\$file" ]] && cat "\$state/\$file"
@@ -245,6 +254,9 @@ check "config volume changes recreate instead of keeping the old mount" bash -c 
 start_run SAPI_ENV=TEST_TOKEN TEST_TOKEN=one
 start_run SAPI_ENV=TEST_TOKEN TEST_TOKEN=one
 check "passed environments always refresh so values cannot become stale" bash -c "[[ \$(grep -c '^create' $stshim/actions) == 5 ]]"
+start_run
+start_run STORED_USER=1234:1234
+check "a stopped non-root container is recreated, never resumed" bash -c "[[ \$(grep -c '^create' $stshim/actions) == 7 ]]"
 rm -rf "$stshim"
 
 echo "shell (docker shim)"
@@ -272,7 +284,7 @@ SHELL_ARGS=--net shell_run RUNS_EXIST_RC=0
 check "--net enables network"                   bash -c "! grep '^run ' $sshim/calls | grep -q -- '--network none'"
 check "runs volume mounted when present"        bash -c "grep '^run ' $sshim/calls | grep -q 'target=/pi-sessions-runs'"
 SHELL_ARGS="" shell_run RUNNING=sapi-proj-x
-check "running agent → exec into it, in /pi-sessions, as the user" bash -c "l=\$(grep '^exec ' $sshim/calls); [[ \$l == *'--workdir /pi-sessions'* && \$l == *'--user '* && \$l == *' sapi-proj-x bash'* ]] && ! grep -q '^run ' $sshim/calls"
+check "running agent → exec into it, in /pi-sessions, as root" bash -c "l=\$(grep '^exec ' $sshim/calls); [[ \$l == *'--workdir /pi-sessions'* && \$l == *'--user '* && \$l == *' sapi-proj-x bash'* ]] && ! grep -q '^run ' $sshim/calls"
 check "shell rejects unknown options"           bash -c "cd $proj && ! PATH=$sshim:\$PATH $S shell --bogus 2>/dev/null"
 check "entrypoint honours SAPI_CMD and skips update for shells" bash -c "cd $proj && $S dockerfile | grep -q 'cmd=\"\${SAPI_CMD:-pi}\"' && $S dockerfile | grep -q '\[ \"\$cmd\" = \"pi\" \] && \[ \"\${SAPI_AUTO_UPDATE:-1}\" = \"1\" \]'"
 rm -rf "$sshim"

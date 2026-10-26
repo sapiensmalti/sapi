@@ -2,7 +2,9 @@
 
 Network access is **unrestricted by default**. Opt-in allowlist mode restricts the agent's external connections to allowed hostnames over HTTP on port 80 and TLS on port 443. It does not inspect encrypted content or make an allowed service trustworthy.
 
-Agents must be non-root and unable to adopt the proxy uid. The launcher rejects root/proxy identities, and the entrypoint drops capabilities before pi or its updater runs. See [agent identity](security.md#agent-identity).
+Agents remain root. The proxy's exemption is tied to its **cgroup-v2 membership**, not its uid, so changing an agent child's Unix identity does not bypass policy. Allowlist mode requires a cgroup-v2 Docker host with per-container `systemd`/`cgroupfs` isolation and the iptables cgroup matcher; disabled/shared cgroup configurations and unsupported kernels fail closed.
+
+**Review-branch release gate:** the new cgroup sidecar is not yet published/pinned. The launcher deliberately rejects the old UID-exempt release image. CI builds the new source locally; the default allowlist must not be considered ready to ship until kernel tests pass and the verified new image/source pins are published.
 
 ```sh
 sapi config set allow "@providers @github @npm"
@@ -39,14 +41,14 @@ The default is `@providers` only. Presets are convenience lists, not coverage of
 
 ## Enforcement
 
-The agent shares a network namespace with a separate Rust sidecar, `NAME-egress`. It receives no `NET_ADMIN` or `NET_RAW` capability. Unlike an advisory `HTTPS_PROXY` variable, the namespace firewall applies even if a client ignores proxy settings.
+The root agent shares a network namespace with a separate Rust sidecar, `NAME-egress`, but not its cgroup. It receives no `SYS_ADMIN`, `NET_ADMIN`, or `NET_RAW` capability and has a private, read-only cgroup hierarchy. Unlike an advisory `HTTPS_PROXY` variable, the namespace firewall applies even if a client ignores proxy settings.
 
 1. The sidecar installs default-drop firewall rules before the agent starts. Agent DNS and TCP 80/443 traffic are redirected to local listeners; other external traffic is dropped. IPv6 agent egress is blocked.
 2. DNS is answered locally, not forwarded: an allowed A query receives the synthetic address `198.18.0.1`, a denied name receives NXDOMAIN, and allowed AAAA queries receive no address.
 3. TLS SNI or the HTTP Host/request-target hostname is checked against the policy. The relay resolves and connects to that name, not to the client's chosen destination IP. Non-public upstream addresses are refused.
 4. The sidecar drops to uid 65532 and checks that it cannot regain root. It publishes readiness only after firewall/listener setup and the privilege drop; sapi waits before starting/resuming the agent.
 
-Loopback remains available. The sidecar's own uid is exempt so it can resolve/connect upstream; sapi refuses to run the agent as uid 65532. The sidecar runs read-only, with a fresh 1 MiB `/run` tmpfs, a 256 MiB memory limit, and a 256-process limit. Firewall chains are reset on restart and stale readiness is removed.
+Loopback remains available. Only sockets in the proxy's exact cgroup (or its descendants) are exempt for upstream resolution/connections. The sidecar obtains that non-root hierarchy path through `--cgroupns host`; `/` or an unavailable cgroup-v2 hierarchy is refused, with no UID fallback. The proxy still drops to uid 65532, but that uid grants no firewall exemption. The sidecar runs read-only, with a fresh 1 MiB `/run` tmpfs, a 256 MiB memory limit, and a 256-process limit. Firewall chains are reset on restart and stale readiness is removed.
 
 ## Logs
 
@@ -69,6 +71,6 @@ Parsed DNS/TLS/HTTP decisions are JSON lines containing the available hostname, 
 
 ## Sidecar source and verification
 
-The published sidecar is digest-pinned; its matching source archive is checksum-pinned. `SAPI_EGRESS_BUILD=1 sapi` builds from that source locally instead of pulling the image. This still requires network access for build inputs. `SAPI_EGRESS_IMAGE` is an explicit trust override. See [the release workflow](../.github/workflows/egress-image.yml) and [`egress/`](../egress).
+Release sidecars are digest-pinned; matching source archives are checksum-pinned. The launcher additionally requires the `cgroup-v2` readiness protocol so an old UID-exempt image cannot silently authorize a root agent. `SAPI_EGRESS_BUILD=1 sapi` builds from that source locally instead of pulling the image. This still requires network access for build inputs. `SAPI_EGRESS_IMAGE` is an explicit trust override. See [the release workflow](../.github/workflows/egress-image.yml) and [`egress/`](../egress).
 
 CI tests launcher/recovery behavior in Debian 12/13 userspaces without a Docker socket. Separate real Docker smoke tests on Linux and macOS exercise allowed/denied destinations, firewall permissions, restart readiness, read-only sidecar storage, and logs. Rust tests cover parsers, address filtering, firewall rules, and relays. Test-only bypass flags are excluded from the production build.

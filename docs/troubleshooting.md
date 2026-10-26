@@ -40,11 +40,14 @@ Pass exported variable names, for example `SAPI_ENV="GH_TOKEN ANTHROPIC_API_KEY"
 **`git commit` needs an identity**
 Inside `sapi shell`, run `git config --global user.name "You"` and `git config --global user.email you@example.com`. The global Git config lives in the shared config volume.
 
-**Linux files were created with unexpected ownership**
-Check `SAPI_UID` / `SAPI_GID` and whether sapi was run as root. Defaults use the invoking Linux user's uid/gid. Repair only affected paths with the intended numeric uid/gid; do not blindly change ownership of a shared project.
+**Linux workspace files are root-owned**
+This is expected: agents always run as container root, regardless of the host user. Root-created private files may also prevent host-user backups. If needed, explicitly repair only the affected host paths with your intended uid/gid. Sapi does not automatically chown a shared project; new agent-created files can become root-owned again.
+
+**An old `SAPI_UID` / `SAPI_GID` setting is rejected**
+Remove nonzero overrides; container identity is now fixed at `0:0`. To replace an already-running legacy non-root agent while preserving its session volume, stop it with `docker stop NAME`, then run `sapi NAME`. A stopped incompatible container is recreated; running processes are not elevated retroactively.
 
 **macOS cannot write `/workspace`**
-Check the Docker provider's file-sharing permissions for this directory. Sapi now uses your host uid/gid inside macOS containers and refuses uid 0. Check file sharing and the selected identity rather than restoring root execution. Host ownership mapping also depends on the provider.
+Check the Docker provider's file-sharing permissions for this directory. Sapi runs as uid/gid 0 inside the container. Check the provider's file-sharing permissions and ownership mapping; these are separate from the container's root identity.
 
 ## Configuration, network, and recovery
 
@@ -52,7 +55,7 @@ Check the Docker provider's file-sharing permissions for this directory. Sapi no
 `sapi config keys` lists supported keys; `sapi config path` prints the selected file. Values are not shell-quoted or expanded. Comments must occupy a whole line; elsewhere `#` is literal. Options such as `SAPI_MODEL` are environment-only. See [configuration](configuration.md).
 
 **A host is blocked, or the network log is empty**
-Presets may need extra provider/login/CDN hosts. Use `sapi netlog NAME` for the relevant sidecar. TLS/HTTP allow records appear when connections end; firewall-dropped packets do not get JSON records. Port 22 and other non-80/443 ports remain blocked. See [network limits](network.md#operational-limits).
+Presets may need extra provider/login/CDN hosts. Use `sapi netlog NAME` for the relevant sidecar. TLS/HTTP allow records appear when connections end; firewall-dropped packets do not get JSON records. Port 22 and other non-80/443 ports remain blocked. An obsolete sidecar/policy or missing cgroup-v2 support is refused rather than falling back to UID filtering. See [network limits](network.md#operational-limits).
 
 **The backup path is inside the workspace / space is insufficient**
 Choose `backup_dir` outside the workspace, with room for a complete archive. Backups include `.git`, build outputs, and secrets. `backup_keep` bounds archive count, not disk use. A failed backup prevents the selected agent start.

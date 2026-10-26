@@ -50,7 +50,7 @@ struct Cli {
     /// Allowed hosts: `host`, `*.suffix`, optional `:port`; comma/space separated.
     #[arg(long, env = "EGRESS_ALLOW", default_value = "")]
     allow: String,
-    /// Unprivileged uid to run as after setup (also the firewall exemption).
+    /// Unprivileged uid to run as after setup (not a firewall exemption).
     #[arg(long, env = "EGRESS_UID", default_value_t = 65532)]
     uid: u32,
     /// Address the listeners bind to.
@@ -161,6 +161,25 @@ fn main() -> Result<()> {
     rt.block_on(run(cli, allow))
 }
 
+fn publish_ready(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    let partial = path.with_extension(format!("partial.{}", std::process::id()));
+    let mut owned = false;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .with_context(|| format!("create {}", partial.display()))?;
+        owned = true;
+        std::io::Write::write_all(&mut file, contents).context("write readiness")?;
+        std::fs::rename(&partial, path).context("publish readiness")
+    })();
+    if result.is_err() && owned {
+        let _ = std::fs::remove_file(&partial);
+    }
+    result
+}
+
 async fn run(cli: Cli, allow: Allowlist) -> Result<()> {
     let (no_firewall, allow_private, test_upstream) = execution_options(&cli);
     // A container restart must never expose last boot's readiness. The
@@ -178,9 +197,10 @@ async fn run(cli: Cli, allow: Allowlist) -> Result<()> {
         http: cli.http_port,
     };
 
-    // 1. Firewall first: from this instant nothing but the proxy uid can leave.
+    // 1. Firewall first. Only sockets in this container's cgroup are exempt;
+    // root in the agent cannot acquire exemption by changing Unix identity.
     if !no_firewall {
-        firewall::apply(cli.uid, ports).context("firewall")?;
+        firewall::apply(ports).context("firewall (requires cgroup v2 and --cgroupns host)")?;
     }
 
     // 2. Bind while still privileged (ports are >1024, but order matters for readiness).
@@ -216,14 +236,28 @@ async fn run(cli: Cli, allow: Allowlist) -> Result<()> {
     }
 
     // 5. Signal readiness. The launcher waits for this before creating the agent.
-    std::fs::write(&cli.ready_file, b"ready\n")
-        .with_context(|| format!("write {}", cli.ready_file.display()))?;
+    let readiness = b"cgroup-v2\n".to_vec();
+    #[cfg(feature = "test-utils")]
+    let readiness = if no_firewall {
+        // Tests request port 0 and receive the ports of bound sockets. No
+        // close-and-rebind reservation race or production bypass marker.
+        serde_json::to_vec(&serde_json::json!({
+            "policy": "test-no-firewall",
+            "dns": dns_udp.local_addr()?.port(),
+            "dns_tcp": dns_tcp.local_addr()?.port(),
+            "tls": tls.local_addr()?.port(),
+            "http": http.local_addr()?.port(),
+        }))?
+    } else {
+        readiness
+    };
+    publish_ready(&cli.ready_file, &readiness)?;
     eprintln!(
         "sapi-egress: ready · {} allowlist entries · dns :{} tls :{} http :{} · uid {}",
         allow.len(),
-        cli.dns_port,
-        cli.tls_port,
-        cli.http_port,
+        dns_udp.local_addr()?.port(),
+        tls.local_addr()?.port(),
+        http.local_addr()?.port(),
         cli.uid
     );
 
@@ -460,4 +494,50 @@ async fn handle(mut client: TcpStream, port: u16, proto: &'static str, state: &S
         down: Some(down),
         ms: Some(started.elapsed().as_millis()),
     });
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn publishes_complete_marker_and_preserves_foreign_partial() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(
+            std::env::temp_dir().join(format!("sapi-ready-{}-{unique}", std::process::id())),
+        );
+        std::fs::create_dir(&fixture.0).unwrap();
+        let path = fixture.0.join("ready");
+        let partial = path.with_extension(format!("partial.{}", std::process::id()));
+        std::fs::write(&path, "old").unwrap();
+        publish_ready(&path, b"cgroup-v2\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"cgroup-v2\n");
+        assert!(!partial.exists());
+
+        let foreign = fixture.0.join("foreign");
+        std::fs::write(&foreign, "keep").unwrap();
+        std::os::unix::fs::symlink(&foreign, &partial).unwrap();
+        assert!(publish_ready(&path, b"replace").is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+        assert!(partial.is_symlink());
+        assert_eq!(std::fs::read(&path).unwrap(), b"cgroup-v2\n");
+        std::fs::remove_file(&partial).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), "data").unwrap();
+        assert!(publish_ready(&path, b"replace").is_err());
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"data");
+    }
 }

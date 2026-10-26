@@ -14,8 +14,9 @@ readonly IMAGE_REPOSITORY="sapi"
 readonly CONFIG_VOLUME="${SAPI_CONFIG_VOLUME:-sapi-config}"
 readonly LABEL="sh.sapi"
 
-# Egress sidecar (network = allowlist). Pinned by digest; the source tarball
-# of the same tag is pinned by checksum for SAPI_EGRESS_BUILD=1. Both are
+# Egress sidecar (network = allowlist). A cgroup-v2 readiness marker is
+# mandatory; legacy UID-exempt images fail closed until pins are refreshed.
+# Pinned by digest; the source tarball of the same tag is pinned by checksum for SAPI_EGRESS_BUILD=1. Both are
 # produced by .github/workflows/egress-image.yml from egress/ in this repo.
 readonly EGRESS_VERSION="0.1.2"
 readonly EGRESS_UID="65532"
@@ -57,41 +58,28 @@ RUN npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@${PI_
 # uv gives the agent Python without touching the host. Two static binaries.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-# Only ownership repair runs privileged. All pi code, including updates and
-# global extensions, runs after the irreversible uid/capability drop.
+# Every managed command, including pi updates and shells, runs as container
+# root. Verify actual credentials rather than trusting USER or environment.
 COPY <<'ENTRYPOINT_EOF' /usr/local/bin/sapi-entrypoint
 #!/bin/bash
 set -eu
+for value in "${SAPI_UID:-0}" "${SAPI_GID:-0}"; do
+    [[ "$value" =~ ^[0-9]+$ && ${#value} -le 10 ]] && (( 10#$value == 0 )) \
+        || { printf 'sapi: container identity is fixed at root (0:0)\n' >&2; exit 1; }
+done
+[[ "$UID:$EUID:$(/usr/bin/id -g):$(/usr/bin/id -rg)" == 0:0:0:0 ]] \
+    || { printf 'sapi: entrypoint requires actual root credentials (0:0)\n' >&2; exit 1; }
+export HOME=/root USER=root LOGNAME=root
 cmd="${SAPI_CMD:-pi}"
-uid="${SAPI_UID:-1000}"
-gid="${SAPI_GID:-1000}"
-for value in "$uid" "$gid"; do
-    [[ "$value" =~ ^[0-9]+$ && ${#value} -le 10 ]] && (( 10#$value < 4294967295 )) \
-        || { printf 'sapi: invalid container uid/gid\n' >&2; exit 1; }
-done
-uid=$((10#$uid)); gid=$((10#$gid))
-(( uid != 0 )) || { printf 'sapi: refusing to run agent commands as root\n' >&2; exit 1; }
-dirs=(/pi-config /pi-sessions /pi-sessions-runs /home/sapi)
-# Only update-enabled agents need a writable npm prefix. No pi code runs as root.
-if [ "$cmd" = "pi" ] && [ "${SAPI_AUTO_UPDATE:-1}" = "1" ]; then dirs+=(/opt/pi); fi
-for dir in "${dirs[@]}"; do
-    [ -d "$dir" ] || continue
-    [ "$(stat -c '%u:%g' "$dir")" = "$uid:$gid" ] || chown -R "$uid:$gid" "$dir"
-done
-exec setpriv --reuid "$uid" --regid "$gid" --clear-groups \
-    --inh-caps=-all --ambient-caps=-all --no-new-privs \
-    env HOME=/home/sapi USER=sapi bash -c '
-        set -eu
-        cmd="$1"; shift
-        if [ "$cmd" = "pi" ] && [ "${SAPI_AUTO_UPDATE:-1}" = "1" ]; then
-            pi update self --no-approve >&2 \
-                || printf "sapi: pi update failed; using installed pi %s\n" "$(pi --version 2>/dev/null)" >&2
-        fi
-        exec "$cmd" "$@"
-    ' sapi "$cmd" "$@"
+if [ "$cmd" = "pi" ] && [ "${SAPI_AUTO_UPDATE:-1}" = "1" ]; then
+    pi update self --no-approve >&2 \
+        || printf 'sapi: pi update failed; using installed pi %s\n' "$(pi --version 2>/dev/null)" >&2
+fi
+exec "$cmd" "$@"
 ENTRYPOINT_EOF
 RUN chmod 0755 /usr/local/bin/sapi-entrypoint
 
+USER 0:0
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/sapi-entrypoint"]
 DOCKERFILE_EOF
@@ -186,7 +174,7 @@ Environment:
   SAPI_PI_VERSION     pi npm version to install in the image (default: latest)
   SAPI_AUTO_UPDATE=0  Do not run 'pi update' on container start
   SAPI_REBUILD=1      Rebuild the image from scratch
-  SAPI_UID / SAPI_GID Container user (default: your uid/gid; agent commands refuse uid 0)
+  SAPI_UID / SAPI_GID Legacy controls: only 0 is accepted; agents and shells always start as 0:0
   SAPI_CONFIG_VOLUME  Docker volume for pi config and credentials (default: sapi-config)
   SAPI_ENV            Space-separated host variables to pass through, e.g. "ANTHROPIC_API_KEY GH_TOKEN"
   SAPI_DOCKER_ARGS    Extra arguments for 'docker create' (split on whitespace)
@@ -257,14 +245,14 @@ normalize_identity() {
         || die "SAPI_UID and SAPI_GID must be valid numeric uid/gid values"
     printf '%s' "$((10#$value))"
 }
-UID_="$(normalize_identity "${SAPI_UID:-$(id -u)}")"
-GID_="$(normalize_identity "${SAPI_GID:-$(id -g)}")"
+UID_="$(normalize_identity "${SAPI_UID:-0}")"
+GID_="$(normalize_identity "${SAPI_GID:-0}")"
 readonly OS WORKSPACE WORKSPACE_HASH PI_VERSION MODEL REBUILD AUTO_UPDATE UID_ GID_
 
 [[ "$REBUILD" == 0 || "$REBUILD" == 1 ]] || die "SAPI_REBUILD must be 0 or 1"
 [[ "$AUTO_UPDATE" == 0 || "$AUTO_UPDATE" == 1 ]] || die "SAPI_AUTO_UPDATE must be 0 or 1"
 require_agent_identity() {
-    [[ "$UID_" != 0 ]] || die "refusing to run an agent as root; use a non-root account or set SAPI_UID/SAPI_GID to a non-root identity with workspace access"
+    [[ "$UID_:$GID_" == 0:0 ]] || die "container identity is fixed at root (0:0); unset SAPI_UID/SAPI_GID or set both to 0"
 }
 
 # The effective Dockerfile is the embedded one plus the user's toolchain
@@ -286,7 +274,9 @@ RUN apt-get update \\
         [[ -r "$SET_dockerfile_extra" ]] || die "cannot read $SET_dockerfile_extra"
         EFFECTIVE_DOCKERFILE+="
 # --- sapi: user Dockerfile.extra ---
-$(cat "$SET_dockerfile_extra")"
+$(cat "$SET_dockerfile_extra")
+# sapi's runtime identity is fixed, even after a user fragment.
+USER 0:0"
     fi
     IMAGE="${SAPI_IMAGE:-$IMAGE_REPOSITORY:$(printf '%s\n%s\n' "$PI_VERSION" "$EFFECTIVE_DOCKERFILE" | sha256 | cut -c1-12)}"
 }
@@ -327,7 +317,7 @@ setting_help() {
   packages     list    extra Debian packages baked into the image, e.g. "golang make postgresql-client"
   dockerfile_extra path  Dockerfile fragment appended to the image when the file exists
                        (default: ~/.config/sapi/Dockerfile.extra; user-level only, never from a project)
-  network      enum    full (default) | allowlist — hostname filter on 80/443; non-root agents only
+  network      enum    full (default) | allowlist — hostname filter on 80/443; cgroup-v2 sidecar required
   allow        list    hosts for network = allowlist: host, *.suffix, host:port, or presets
                        @providers @github @npm @pypi @cargo @go @debian @huggingface  (default: @providers)
 HELP
@@ -435,13 +425,12 @@ SET_safer=""; SET_backup_dir=""; SET_backup_keep=""; SET_cpus=""; SET_memory_mib
 # ---------------------------------------------------------------------------
 # Egress allowlist (network = allowlist)
 #
-# The agent container shares the network namespace of a sidecar that owns
-# the namespace firewall and a transparent filter: every uid but the
-# sidecar's own has DNS, 80 and 443 redirected to it and everything else
-# dropped. The sidecar answers DNS itself (allowed names get a sink address,
-# others NXDOMAIN), reads the TLS SNI or HTTP Host, checks the allowlist and
-# connects by *name*. The agent holds no network capabilities and cannot
-# change any of this. Source: egress/ in the sapi repository.
+# The root agent shares the sidecar's network namespace, not its cgroup.
+# Only proxy-cgroup sockets are exempt. Agent DNS/80/443 are redirected and
+# other external traffic is dropped regardless of uid. The sidecar answers
+# DNS locally, checks TLS SNI / HTTP Host, and connects by name. Root may
+# change a child uid, but cannot join the proxy cgroup or change the rules
+# without SYS_ADMIN/NET_ADMIN, which are never part of the managed spec.
 # ---------------------------------------------------------------------------
 allow_presets() { printf '@providers @github @npm @pypi @cargo @go @debian @huggingface'; }
 allow_preset() {  # $1 name -> hosts, or return 1
@@ -525,7 +514,7 @@ egress_start() {  # $1 agent container name, $2 extra docker run flags (e.g. --r
         docker container rm --force "$name" >/dev/null || die "egress: cannot replace $name"
     fi
     # shellcheck disable=SC2086
-    docker run --detach $extra --name "$name" --init --read-only \
+    docker run --detach $extra --name "$name" --init --read-only --cgroupns host \
         --tmpfs "/run:rw,noexec,nosuid,nodev,size=1048576,mode=755" \
         --label "$LABEL.managed=true" --label "$LABEL.egress-of=$agent" --label "$LABEL.workspace=$WORKSPACE" --label "$LABEL.workspace-hash=$WORKSPACE_HASH" \
         --env "EGRESS_ALLOW=$(expand_allow "$SET_allow")" --env "EGRESS_UID=$EGRESS_UID" \
@@ -533,6 +522,7 @@ egress_start() {  # $1 agent container name, $2 extra docker run flags (e.g. --r
         --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \
         --pids-limit 256 --memory 256m \
         "$EGRESS_IMAGE_REF" >/dev/null || die "egress: could not start sidecar"
+    EGRESS_STOP_NAME="$name" # readiness/policy failures must clean up our sidecar
     egress_wait "$name"
 }
 
@@ -540,6 +530,8 @@ egress_wait() {
     local name="$1"
     for _ in $(seq 1 100); do
         if docker exec "$name" test -f /run/egress/ready 2>/dev/null; then
+            docker exec "$name" grep -qx 'cgroup-v2' /run/egress/ready 2>/dev/null \
+                || die "egress: sidecar $name has an obsolete/unsafe policy; a cgroup-v2 sidecar is required"
             return 0
         fi
         if [[ "$(inspect "$name" '{{.State.Running}}')" != true ]]; then break; fi
@@ -1004,7 +996,7 @@ cmd_shell() {
     if [[ -n "$running" ]]; then
         log "shell: joining running container $running"
         shell_banner "$(label "$running" sessions-volume)" ""
-        exec docker exec --interactive --tty --user "$UID_:$GID_" --env HOME=/home/sapi --workdir /pi-sessions "$running" bash
+        exec docker exec --interactive --tty --user 0:0 --env HOME=/root --env USER=root --env LOGNAME=root --workdir /pi-sessions "$running" bash
     fi
 
     # Nothing running: an ephemeral container with the same spec and volumes.
@@ -1093,6 +1085,10 @@ container_args() {  # $1 container name, $2 sessions volume; sets CONTAINER_ARGS
         read -r -a extra <<< "$words"
         a+=("${extra[@]}")
     fi
+    # Docker accepts the last occurrence. Identity/cgroup isolation and the
+    # root-checking entrypoint cannot be replaced by extra Docker flags.
+    a+=(--user 0:0 --cgroupns private --entrypoint /usr/local/bin/sapi-entrypoint
+        --env SAPI_UID=0 --env SAPI_GID=0)
     CONTAINER_ARGS=("${a[@]}")
 }
 
@@ -1111,7 +1107,7 @@ compute_settings_signature() {
     # through SAPI_ENV are deliberately not hashed into a public container
     # label; such containers are recreated instead of resumed (see cmd_start).
     SETTINGS_SIGNATURE="$(printf '%s\0' \
-        "$NETWORK_SIGNATURE" "$MODEL" "$UID_:$GID_" "$AUTO_UPDATE_EFFECTIVE" \
+        root-v1 "$NETWORK_SIGNATURE" "$MODEL" "$UID_:$GID_" "$AUTO_UPDATE_EFFECTIVE" \
         "$SET_cpus" "$SET_memory_mib" "$SET_pids" "$CONFIG_VOLUME" \
         "${SAPI_ENV:-}" "${SAPI_DOCKER_ARGS:-}" | sha256 | cut -c1-12)"
 }
@@ -1120,8 +1116,15 @@ prepare_network() {
     NETWORK_SIGNATURE="$SET_network"
     AUTO_UPDATE_EFFECTIVE="$AUTO_UPDATE"
     if [[ "$SET_network" == allowlist ]]; then
-        [[ "$UID_" != "$EGRESS_UID" ]] || die "network: agent uid $EGRESS_UID would inherit the sidecar's firewall exemption; set SAPI_UID to another uid"
-        NETWORK_SIGNATURE="allowlist:$(printf '%s' "$(expand_allow "$SET_allow")" | sha256 | cut -c1-12)"
+        require_docker
+        local cgroup_info
+        cgroup_info="$(docker info --format '{{.CgroupVersion}} {{.CgroupDriver}}')" \
+            || die "network: cannot determine Docker cgroup isolation"
+        case "$cgroup_info" in
+            '2 systemd'|'2 cgroupfs') ;;
+            *) die "network: allowlist requires cgroup v2 with per-container systemd/cgroupfs isolation (got: $cgroup_info)" ;;
+        esac
+        NETWORK_SIGNATURE="allowlist-cgroup-v2:$(printf '%s' "$(expand_allow "$SET_allow")" | sha256 | cut -c1-12)"
         if [[ "$AUTO_UPDATE" == 1 ]] && ! allow_includes_preset npm; then
             AUTO_UPDATE_EFFECTIVE=0
             log "network: allowlist without @npm; skipping pi self-update on start"
@@ -1165,6 +1168,7 @@ cmd_start() {
         case "$(inspect "$name" '{{.State.Status}}')" in
             created | exited | dead)
                 if [[ "$(inspect "$name" '{{.Image}}')" == "$image_id" \
+                    && "$(inspect "$name" '{{.Config.User}}')" == 0:0 \
                     && "$(label "$name" version)" == "$SAPI_VERSION" \
                     && "$(label "$name" model)" == "$MODEL" \
                     && "$(label "$name" user)" == "$UID_:$GID_" \

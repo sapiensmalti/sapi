@@ -6,14 +6,14 @@ S="$PWD/sapi"
 tmp="$(mktemp -d)"; tmp="$(cd "$tmp" && pwd -P)"
 trap 'rm -rf -- "$tmp"' EXIT
 export HOME="$tmp/home" SAPI_CONFIG_FILE="$tmp/config" SAPI_BACKUP_DIR="$tmp/backups"
-export SAPI_UID=1234 SAPI_GID=1234
+export SAPI_UID=0 SAPI_GID=0
 unset SAPI_DOCKER_ARGS SAPI_ENV SAPI_IMAGE SAPI_NETWORK SAPI_ALLOW SAPI_SAFER
 mkdir -p "$HOME" "$tmp/bin" "$tmp/work"
 export CALLS="$tmp/calls"
 cat >"$tmp/bin/docker" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "$1" >>"$CALLS"
-case "$1" in run) printf 'agent started\n' ;; esac
+case "$1" in run) printf '%s\n' "$@" >"$CALLS.args"; printf 'agent started\n' ;; esac
 exit 0
 SHIM
 chmod +x "$tmp/bin/docker"
@@ -61,19 +61,40 @@ check "diff startup identity errors also return 2" test "$rc" -eq 2
 SAPI_AUTO_UPDATE=invalid call diff
 check "diff startup option errors also return 2" test "$rc" -eq 2
 printf 'safer = false\n' >"$SAPI_CONFIG_FILE"
-# Reject root (including zero-padded spellings) before making any Docker call.
-for uid in 0 00 0000000000 4294967295 99999999999; do
+# No caller may select a non-root identity, including zero-padded aliases.
+for uid in 1 1234 0000065532 4294967295 99999999999; do
     SAPI_UID="$uid" call run test
     check "uid $uid is refused" test "$rc" -eq 1
     check "uid $uid fails before Docker is touched" test ! -s "$CALLS"
 done
-SAPI_UID=0000065532 SAPI_NETWORK=allowlist call run test
-check "zero-padded proxy uid is refused" test "$rc" -eq 1
-check "proxy uid is rejected before Docker is touched" test ! -s "$CALLS"
-SAPI_UID=001234 SAPI_GID=001234 call run test
-check "valid zero-padded identities remain usable" test "$rc" -eq 0
-# Exercise macOS identity selection without requiring a VM. Host identity,
-# rather than uid 0, must be used by default on every supported platform.
+SAPI_GID=1234 call run test
+check "a non-root group is refused" test "$rc" -eq 1
+check "non-root group fails before Docker is touched" test ! -s "$CALLS"
+for uid in 0 00 0000000000; do
+    SAPI_UID="$uid" SAPI_GID="$uid" call run test
+    check "root spelling $uid is accepted" test "$rc" -eq 0
+done
+SAPI_DOCKER_ARGS='--user 1234:1234 --cgroupns host --entrypoint /bin/false --env SAPI_UID=1234' call run test
+check "extra Docker flags cannot change the root launch identity" test "$(awk '$0 == "--user" {getline; value=$0} END {print value}' "$CALLS.args")" = 0:0
+check "extra Docker flags cannot share the proxy cgroup namespace" test "$(awk '$0 == "--cgroupns" {getline; value=$0} END {print value}' "$CALLS.args")" = private
+check "extra Docker flags cannot replace the root-checking entrypoint" test "$(awk '$0 == "--entrypoint" {getline; value=$0} END {print value}' "$CALLS.args")" = /usr/local/bin/sapi-entrypoint
+check "extra environment cannot request a non-root uid" test "$(awk '$0 == "--env" {getline; if ($0 ~ /^SAPI_UID=/) value=$0} END {print value}' "$CALLS.args")" = SAPI_UID=0
+# Exercise the actual entrypoint locally without any pi execution, filesystem
+# changes, credentials, or network. Root containers also run this in Debian CI.
+"$S" dockerfile | awk "/^COPY <<'ENTRYPOINT_EOF'/ {printing=1; next} /^ENTRYPOINT_EOF$/ {printing=0} printing" >"$tmp/entrypoint"
+rc=0
+SAPI_CMD=/usr/bin/id SAPI_AUTO_UPDATE=0 bash "$tmp/entrypoint" -u >"$tmp/entry.out" 2>"$tmp/entry.err" || rc=$?
+if [[ "$(id -u):$(id -g)" == 0:0 ]]; then
+    check "actual root entrypoint succeeds without dropping identity" test "$rc" -eq 0
+    check "entrypoint-launched command observes uid 0" grep -qx 0 "$tmp/entry.out"
+else
+    check "actual non-root entrypoint is refused" test "$rc" -eq 1
+    check "non-root guard reports actual credential failure" grep -q 'actual root credentials' "$tmp/entry.err"
+fi
+printf 'USER 1234:1234\n' >"$tmp/override.df"
+SAPI_DOCKERFILE_EXTRA="$tmp/override.df" "$S" dockerfile >"$tmp/custom.df"
+check "user fragment cannot change the final image user" test "$(tail -n1 "$tmp/custom.df")" = 'USER 0:0'
+# Host identity must never change the root identity on either platform.
 cat >"$tmp/bin/uname" <<'SHIM'
 #!/bin/sh
 printf 'Darwin\n'
@@ -92,8 +113,13 @@ exit 0
 SHIM
 rc=0
 (cd "$tmp/work" && env -u SAPI_UID -u SAPI_GID "$S" run test) >"$tmp/out" 2>"$tmp/err" || rc=$?
-check "macOS default can start with the host identity" test "$rc" -eq 0
-check "macOS passes the host uid" grep -qx 'SAPI_UID=501' "$CALLS.args"
-check "macOS passes the host gid" grep -qx 'SAPI_GID=20' "$CALLS.args"
+check "macOS non-root caller starts a root agent" test "$rc" -eq 0
+check "macOS passes root uid, not the host uid" grep -qx 'SAPI_UID=0' "$CALLS.args"
+check "macOS passes root gid, not the host gid" grep -qx 'SAPI_GID=0' "$CALLS.args"
+printf '#!/bin/sh\nprintf "Linux\\n"\n' >"$tmp/bin/uname"
+rc=0
+(cd "$tmp/work" && env -u SAPI_UID -u SAPI_GID "$S" run test) >"$tmp/out" 2>"$tmp/err" || rc=$?
+check "Linux non-root caller starts a root agent" test "$rc" -eq 0
+check "Linux forces the Docker user to root" test "$(awk '$0 == "--user" {getline; value=$0} END {print value}' "$CALLS.args")" = 0:0
 printf '\n%d safety checks passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

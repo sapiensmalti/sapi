@@ -30,6 +30,13 @@ cleanup() {
         docker volume ls -q --filter "label=sh.sapi.workspace=$p" | while IFS= read -r resource; do docker volume rm "$resource" >/dev/null 2>&1; done
     done
     docker volume rm "$SHELL_CONFIG" "$SHELL_SESSIONS" "$SAPI_CONFIG_VOLUME" >/dev/null 2>&1
+    # Agents create root-owned fixture files. Clean only this private mount,
+    # with no network or Docker socket, before removing the test image.
+    if [[ -d "$test_root" ]] && docker image inspect "$SAPI_IMAGE" >/dev/null 2>&1; then
+        docker run --rm --network none --user 0:0 --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add FOWNER \
+            --mount "type=bind,source=$test_root,target=/test-fixtures" --entrypoint /bin/sh \
+            "$SAPI_IMAGE" -c 'find /test-fixtures -mindepth 1 -delete' >/dev/null 2>&1
+    fi
     docker image rm -f "$PROBE_IMAGE" "$PKG_IMAGE" "$SAPI_IMAGE" "$EGRESS_IMAGE" >/dev/null 2>&1
     rm -rf -- "$test_root"
     exit "$rc"
@@ -43,26 +50,15 @@ harden=(--security-opt no-new-privileges --cap-drop ALL
     --cap-add SETUID --cap-add SETGID)
 run() { docker run --rm --init "${harden[@]}" -e SAPI_AUTO_UPDATE=0 -v "$ws:/workspace" "$@"; }
 sapi_bin="$PWD/sapi"
-uid="$(id -u)"; gid="$(id -g)"
-if [[ "$uid" == 0 ]]; then
-    uid=1234; gid=1234
-    chown "$uid:$gid" "$ws" # Only this private fixture, never a user's project.
-fi
-export SAPI_UID="$uid" SAPI_GID="$gid"
+uid=0; gid=0
+export SAPI_UID=0 SAPI_GID=0
 
 echo 'entrypoint'
-out="$(run "$SAPI_IMAGE" --version 2>&1)" && ok "pi --version with default non-root identity: $out" || bad "pi --version: $out"
-if run -e SAPI_UID=0 "$SAPI_IMAGE" --version >/dev/null 2>&1; then bad 'image accepted uid 0'; else ok 'image refuses uid 0'; fi
-out="$(run -e "SAPI_UID=$uid" -e "SAPI_GID=$gid" "$SAPI_IMAGE" --version 2>&1)" \
-    && ok "pi --version as $uid:$gid" || bad "non-root pi: $out"
-# Exercise host bind-mount writing and zero capabilities on both platforms.
-owner="$(run -e "SAPI_UID=$uid" -e "SAPI_GID=$gid" --entrypoint /bin/bash "$SAPI_IMAGE" -c '
-    mkdir -p /tmp/fake
-    printf "#!/bin/sh\ntouch /workspace/probe; id -u; id -g; echo \$HOME; grep -E \"^Cap(Eff|Prm)\" /proc/self/status | tr \"\\t\" \" \" | cut -d\" \" -f2\n" > /tmp/fake/pi
-    chmod +x /tmp/fake/pi
-    PATH=/tmp/fake:$PATH exec /usr/local/bin/sapi-entrypoint' 2>&1 | tr '\n' ' ')"
-[[ "$owner" == "$uid $gid /home/sapi 0000000000000000 0000000000000000 " ]] \
-    && ok "drops to $uid:$gid, writes workspace, and has no capabilities" || bad "privilege drop: $owner"
+out="$(run "$SAPI_IMAGE" --version 2>&1)" && ok "pi --version as root: $out" || bad "pi --version: $out"
+if run --user 1234:1234 "$SAPI_IMAGE" --version >/dev/null 2>&1; then bad 'entrypoint accepted non-root credentials'; else ok 'entrypoint refuses non-root execution'; fi
+if run -e SAPI_UID=1234 "$SAPI_IMAGE" --version >/dev/null 2>&1; then bad 'entrypoint accepted a non-root uid request'; else ok 'entrypoint rejects non-root uid requests'; fi
+owner="$(run -e SAPI_CMD=bash "$SAPI_IMAGE" -c 'touch /workspace/probe; id -u; id -g; printf "%s\n" "$HOME"' 2>&1 | tr '\n' ' ')"
+[[ "$owner" == '0 0 /root ' ]] && ok 'root writes workspace with root environment' || bad "root identity: $owner"
 if [[ "$(uname -s)" == Linux ]]; then
     got="$(stat -c '%u:%g' "$ws/probe")"
     [[ "$got" == "$uid:$gid" ]] && ok 'workspace file has the intended ownership' || bad "file ownership: $got"
@@ -93,20 +89,19 @@ cp test/agent-probe.sh "$probe_ctx/probe.sh"
 printf 'FROM %s\nRUN rm /opt/pi/bin/pi\nCOPY probe.sh /opt/pi/bin/pi\nRUN chmod 0755 /opt/pi/bin/pi\n' "$SAPI_IMAGE" >"$probe_ctx/Dockerfile"
 if docker build -q -t "$PROBE_IMAGE" "$probe_ctx" >/dev/null; then ok 'test-only probe image builds'; else bad 'probe image build'; exit 1; fi
 probe_project="$test_root/production-project"; mkdir "$probe_project"; TEST_PROJECTS+=" $probe_project"
-if [[ "$(id -u)" == 0 ]]; then chown "$uid:$gid" "$probe_project"; fi
-out="$(cd "$probe_project" && SAPI_IMAGE="$PROBE_IMAGE" SAPI_AUTO_UPDATE=1 "$sapi_bin" run sapi-probe-identity 2>"$test_root/probe.err")" \
-    && ok 'production launcher prevents root/proxy-uid adoption with zero capabilities' || bad "production identity: $out $(cat "$test_root/probe.err")"
-grep -q "probe: update unprivileged uid=$uid" "$test_root/probe.err" \
-    && ok 'pi update also runs unprivileged with a writable npm prefix' || bad "updater: $(cat "$test_root/probe.err")"
+out="$(cd "$probe_project" && SAPI_IMAGE="$PROBE_IMAGE" SAPI_AUTO_UPDATE=1 SAPI_DOCKER_ARGS='--user 1234:1234' "$sapi_bin" run sapi-probe-identity 2>"$test_root/probe.err")" \
+    && ok 'production launcher enforces actual root despite an extra --user flag' || bad "root identity: $out $(cat "$test_root/probe.err")"
+grep -q 'probe: update root uid=0 gid=0' "$test_root/probe.err" \
+    && ok 'pi update also runs as root' || bad "updater: $(cat "$test_root/probe.err")"
 
 echo 'egress allowlist'
 if docker build -q -f egress/Dockerfile -t "$EGRESS_IMAGE" egress >/dev/null; then ok 'sidecar builds'; else bad 'sidecar build'; exit 1; fi
-docker run -d --name "$EGRESS_CONTAINER" --init --read-only \
+docker run -d --name "$EGRESS_CONTAINER" --init --read-only --cgroupns host \
     --tmpfs '/run:rw,noexec,nosuid,nodev,size=1048576,mode=755' \
     --security-opt no-new-privileges --cap-drop ALL --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \
     -e EGRESS_ALLOW='api.github.com deb.debian.org' "$EGRESS_IMAGE" >/dev/null
 for _ in $(seq 1 50); do docker exec "$EGRESS_CONTAINER" test -f /run/egress/ready 2>/dev/null && break; sleep 0.2; done
-docker exec "$EGRESS_CONTAINER" test -f /run/egress/ready && ok 'sidecar ready' || { bad 'sidecar readiness'; docker logs "$EGRESS_CONTAINER"; }
+docker exec "$EGRESS_CONTAINER" grep -qx cgroup-v2 /run/egress/ready && ok 'cgroup-v2 sidecar ready' || { bad 'cgroup-v2 sidecar readiness'; docker logs "$EGRESS_CONTAINER"; exit 1; }
 docker exec "$EGRESS_CONTAINER" ps -o user,comm | grep -q 'egress .*sapi-egress' && ok 'unprivileged proxy' || bad 'proxy uid'
 help="$(docker run --rm --entrypoint /usr/local/bin/sapi-egress "$EGRESS_IMAGE" --help)"
 ! grep -qE 'no-firewall|test-upstream|allow-private' <<<"$help" && ok 'no production bypass flags' || bad 'bypass flags exposed'
@@ -114,10 +109,11 @@ docker exec "$EGRESS_CONTAINER" touch /sapi-write-test >/dev/null 2>&1 && bad 's
 docker restart "$EGRESS_CONTAINER" >/dev/null
 for _ in $(seq 1 50); do docker exec "$EGRESS_CONTAINER" test -f /run/egress/ready 2>/dev/null && break; sleep 0.2; done
 docker exec "$EGRESS_CONTAINER" test -f /run/egress/ready && ok 'restart ready' || bad 'restart readiness'
-[[ "$(docker exec -u 0 "$EGRESS_CONTAINER" iptables -S | grep -c -- '-A OUTPUT -m owner --uid-owner 65532 -j ACCEPT')" == 1 ]] \
-    && ok 'restart does not duplicate firewall rules' || bad 'duplicate firewall rules'
+[[ "$(docker exec -u 0 "$EGRESS_CONTAINER" iptables -S | grep -cE -- '-A OUTPUT -m cgroup --path .* -j ACCEPT')" == 1 ]] \
+    && ok 'restart does not duplicate cgroup firewall rules' || bad 'duplicate cgroup firewall rules'
+! docker exec -u 0 "$EGRESS_CONTAINER" iptables -S | grep -q -- '--uid-owner' && ok 'no uid-based exemption remains' || bad 'uid exemption remains'
 # Bare probes isolate the firewall; production-spec probes below also test
-# the actual launcher, bootstrap capabilities, uid drop, and update path.
+# the actual launcher, root credentials/capabilities, and update path.
 agent() { local ep="$1"; shift; docker run --rm --network container:"$EGRESS_CONTAINER" --cap-drop ALL --security-opt no-new-privileges --entrypoint "$ep" "$SAPI_IMAGE" "$@"; }
 agent curl -sS -m 20 -o /dev/null -w '%{http_code}' https://api.github.com/ 2>/dev/null | grep -qE '^[1-5][0-9][0-9]$' \
     && ok 'allowed TLS upstream responds (including rate-limit HTTP status)' || bad 'allowed TLS unreachable'
@@ -136,8 +132,8 @@ for _ in $(seq 1 25); do
 done
 [[ "$logged" == 1 ]] && ok 'allow/deny logs recorded' || bad 'egress logs missing'
 out="$(cd "$probe_project" && SAPI_IMAGE="$PROBE_IMAGE" SAPI_NETWORK=allowlist SAPI_ALLOW='@providers @npm api.github.com' SAPI_AUTO_UPDATE=1 SAPI_EGRESS_IMAGE="$EGRESS_IMAGE" "$sapi_bin" run sapi-probe-network 2>"$test_root/network-probe.err")" \
-    && ok 'production allowlist blocks uid adoption and denied traffic' || bad "production network: $out $(cat "$test_root/network-probe.err")"
-grep -q 'probe: update unprivileged' "$test_root/network-probe.err" && ok 'allowlisted updater is unprivileged' || bad 'allowlisted updater'
+    && ok 'production root allowlist blocks denied traffic even after adopting the proxy uid' || bad "production network: $out $(cat "$test_root/network-probe.err")"
+grep -q 'probe: update root uid=0 gid=0' "$test_root/network-probe.err" && ok 'allowlisted updater is root' || bad 'allowlisted updater identity'
 [[ -z "$(docker ps -aq --filter "label=sh.sapi.egress-of" --filter "label=sh.sapi.workspace=$probe_project")" ]] \
     && ok 'headless sidecar removed' || bad 'headless sidecar leaked'
 if (( fail > 0 )); then
@@ -153,7 +149,7 @@ out="$(docker run --rm --network none "${harden[@]}" \
     --workdir /pi-sessions "$SAPI_IMAGE" -c 'pwd; id -u; touch probe && stat -c %u probe' 2>&1)"
 [[ "$(sed -n 1p <<<"$out")" == /pi-sessions ]] && ok 'shell cwd' || bad "shell cwd: $out"
 [[ "$(sed -n 2p <<<"$out")" == "$uid" && "$(sed -n 3p <<<"$out")" == "$uid" ]] \
-    && ok 'non-root shell writes sessions on this provider' || bad "shell uid: $out"
+    && ok 'root shell writes sessions on this provider' || bad "shell uid: $out"
 
 echo 'headless results and recovery'
 proj="$test_root/run-project"; mkdir "$proj"; TEST_PROJECTS+=" $proj"; echo hello >"$proj/a.txt"

@@ -19,7 +19,8 @@ Running sapi in your home directory intentionally grants your home directory. Ru
 
 The shared container specification uses:
 
-- `--cap-drop ALL` plus only `CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER SETUID SETGID`, used only for ownership repair and privilege dropping. `SETPCAP` is not granted. The production entrypoint drops to a non-root uid, clears supplementary groups and inheritable/ambient capabilities, and sets `no-new-privileges` before running any pi code, including self-update. Kernel smoke probes check zero capabilities and failed root/proxy-uid adoption through the real launcher on both Linux and macOS.
+- Agents, pi updates, and shells start as **root (uid/gid 0:0)** on every platform. Dockerfile/runtime user selection is explicit, and the entrypoint verifies actual root credentials. Sapi does not drop the agent to the host user's identity.
+- `--cap-drop ALL` plus `CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER SETUID SETGID`. Root retains these capabilities inside the container; `SETPCAP`, `SYS_ADMIN`, `NET_ADMIN`, and `NET_RAW` are not granted. Root is not the same as a host-privileged container.
 - `--security-opt no-new-privileges`, so setuid/file-capability execution cannot add privileges.
 - `--init`; optional CPU, memory, and pid ceilings.
 - No host network/PID namespace, no privileged mode, and no socket mounts **unless the user deliberately overrides the specification** (below).
@@ -27,11 +28,13 @@ The shared container specification uses:
 
 ### Agent identity
 
-Both Linux and macOS default to the invoking user's numeric uid/gid. Agent and shell commands refuse uid 0; an explicitly selected identity must have workspace access. Host root can build images or manage backups, but must select a non-root identity to launch an agent. Sapi does not change workspace ownership automatically.
+All managed agent launches and shells use real/effective uid 0 and gid 0. Nonzero `SAPI_UID` / `SAPI_GID` requests are refused. Extra Docker flags cannot replace the final user selection, private cgroup namespace, or root-checking entrypoint. A stopped legacy non-root container is recreated rather than resumed. Already-running containers are not modified retroactively.
 
-The proxy's uid is exempt from its firewall, so an agent must not be able to adopt it. Rejecting an initial uid collision alone is insufficient: the production entrypoint also drops identity-changing capabilities before running pi or its updater. Successful identity changes must remain impossible after exec, not just at initial startup.
+On Linux, new workspace files may be root-owned; restrictive modes may prevent host-user reads, edits, or backups. MacOS ownership mapping depends on the Docker provider. Sapi does not silently change host workspace ownership. Container root may deliberately run child commands under other identities; the primary agent/updater/shell is launched as root.
 
-Invalid configuration and environment values abort before launching Docker resources. This includes malformed safety booleans and zero-padded root/proxy identities. See [configuration](configuration.md#config-file).
+Allowlist exemption is based on the sidecar's cgroup-v2 membership, not Unix uid. Changing an agent child's uid, including to the proxy uid, must not grant exemption. Agents have a private, read-only cgroup hierarchy and no `SYS_ADMIN` to change it; the proxy uses a host cgroup namespace to discover its exact membership. Unsupported kernels and legacy UID-exempt sidecars fail closed. See [network](network.md).
+
+Invalid configuration/environment values still abort before launching Docker resources. The root policy does not relax safety-setting validation. See [configuration](configuration.md#config-file).
 
 ## Explicit escape hatches
 

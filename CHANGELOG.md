@@ -5,8 +5,10 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 ## Unreleased
 
 - Fail closed on invalid environment overrides; preserve intentionally empty config lists and return `2` for all diff validation failures.
-- Refuse root agent identities on every platform and normalize numeric uid/gid values before policy checks. Run pi, startup updates, and shells only after dropping privileges/capabilities; use `/opt/pi` for unprivileged npm updates.
-- Test the production launcher/entrypoint privilege profile, workspace writing, updates, and allowlist identity separation on Linux and macOS, not just stricter bare firewall probes.
+- Enforce container root (`0:0`) for every managed agent, pi updater, and shell on all platforms. Reject non-root identity requests, override conflicting Docker user/entrypoint flags, and verify real root credentials at the entrypoint. Linux workspace files may consequently be root-owned.
+- Replace proxy-UID firewall exemptions with exact cgroup-v2 membership; require compatible readiness and fail closed on legacy images/unsupported kernels. Publishing the new verified sidecar pins remains a release gate.
+- Add production-profile probes for root updates, workspace writes, conflicting user flags, cgroup isolation, and network enforcement after deliberate child-UID changes.
+- Publish readiness atomically; use server-assigned ephemeral ports in Rust integration tests instead of close-and-rebind port probes, and clean up child processes/readiness files on test failure.
 
 - Preserve saved originals if selective-restore rollback fails, the destination reappears, or a signal leaves the swap's commit uncertain; print the recovery path.
 - Refuse incomplete backup locks and serialize stale-owner recovery with an ownership recheck; never reclaim a lock merely because its PID has not been written yet.

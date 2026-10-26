@@ -4,9 +4,9 @@
 
 [pi](https://github.com/earendil-works/pi) in Docker, scoped to the directory you run it from.
 
-sapi mounts the current directory at `/workspace`. Credentials, settings, and session history live in Docker volumes. It does not mount your home directory, SSH agent, or Docker socket by default.
+sapi mounts the current directory at `/workspace`. Agents, pi updates, and shells run as **root inside their own containers** on every platform. Credentials, settings, and session history live in Docker volumes. It does not mount your home directory, SSH agent, or Docker socket by default.
 
-**The workspace remains writable and network access is unrestricted by default.** Credentials and pi settings are shared across projects unless you choose a separate config volume. Read the [security model](docs/security.md) before running untrusted code.
+**The workspace remains writable and network access is unrestricted by default.** On Linux, newly created files may be root-owned; sapi does not silently repair host ownership. Credentials and pi settings are shared across projects unless you choose a separate config volume. Read the [security model](docs/security.md) before running untrusted code.
 
 ## Install and start
 
@@ -80,7 +80,7 @@ sapi config set allow "@providers @github @npm"
 Config-file settings use flag > environment > config > default precedence. Other controls, such as `SAPI_MODEL`, `SAPI_PI_VERSION`, and `SAPI_ENV`, are environment-only. See the [configuration reference](docs/configuration.md).
 
 - [Toolchains](docs/toolchain.md): extra Debian packages and user Dockerfile fragments.
-- [Network allowlist](docs/network.md): hostname filtering on ports 80/443; off by default. Requires a [non-root agent identity](docs/security.md#agent-identity).
+- [Network allowlist](docs/network.md): hostname filtering on ports 80/443; off by default. Uses a separate cgroup-based proxy boundary; see [identity and isolation](docs/security.md#agent-identity).
 - `sapi dockerfile`: print the effective Dockerfile, including customizations.
 - `sapi build`: build or reuse the image without starting an agent.
 - `sapi help`: command reference.

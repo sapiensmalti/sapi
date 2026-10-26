@@ -60,7 +60,7 @@ These are **not** accepted by `sapi config set`.
 | `SAPI_PI_VERSION` | `latest`; pi version requested when building the image |
 | `SAPI_AUTO_UPDATE` | `1`; `0` disables pi's update attempt on agent start |
 | `SAPI_REBUILD` | `0`; `1` rebuilds with `--no-cache --pull` |
-| `SAPI_UID` / `SAPI_GID` | Host uid/gid on Linux and macOS; agent commands refuse uid `0`; see [agent identity](security.md#agent-identity) |
+| `SAPI_UID` / `SAPI_GID` | Legacy compatibility controls: agent commands accept only `0`; all agents/shells start as `0:0` |
 | `SAPI_CONFIG_VOLUME` | `sapi-config`; shared pi credentials/settings volume |
 | `SAPI_ENV` | Empty; whitespace-separated names of host variables to pass through |
 | `SAPI_DOCKER_ARGS` | Empty; extra Docker arguments, whitespace-split without quote interpretation or glob expansion |
@@ -68,7 +68,9 @@ These are **not** accepted by `sapi config set`.
 | `SAPI_EGRESS_IMAGE` | Override the digest-pinned sidecar image |
 | `SAPI_EGRESS_BUILD` | `1` builds the sidecar from checksum-pinned source instead of pulling it |
 
-UID/GID values are numeric and normalized before use. The agent uid must be nonzero, and in allowlist mode cannot equal the proxy uid (65532). Sapi never changes host workspace ownership to make an identity fit; choose a user with access to the shared directory. Invoking an agent command as host root requires an explicit non-root `SAPI_UID` and appropriate `SAPI_GID`.
+Root identity is fixed inside the container, regardless of the host user or OS. Remove old nonzero `SAPI_UID` / `SAPI_GID` settings; zero-padded zero values are normalized. Extra `--user`, `--cgroupns`, or `--entrypoint` Docker flags cannot override the managed launch policy. Custom images must provide the compatible `/usr/local/bin/sapi-entrypoint`; arbitrary custom image/build code remains a trust decision.
+
+On Linux, agent-created workspace files may be root-owned, and private root-owned files can make host-side backups fail. Sapi does not automatically chown the workspace. See [agent identity](security.md#agent-identity).
 
 `SAPI_ENV` passes names, not literal assignments: after exporting a provider key, use `SAPI_ENV=OPENROUTER_API_KEY sapi`. Containers using `SAPI_ENV` are recreated on start so secret values do not become stale; those values are not hashed into labels.
 

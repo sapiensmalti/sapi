@@ -5,14 +5,16 @@
 //! Everything the agent emits is locally generated traffic in this network
 //! namespace, so the OUTPUT chains are the whole story:
 //!
-//! * filter OUTPUT policy DROP; allow loopback; allow the proxy's own uid.
-//! * nat OUTPUT: for every uid except the proxy, redirect TCP 443 → TLS
-//!   filter, TCP 80 → HTTP filter, UDP/TCP 53 → fake DNS.
+//! * filter OUTPUT policy DROP; allow loopback and the proxy's own cgroup.
+//! * nat OUTPUT: outside the proxy cgroup, redirect TCP 443 → TLS filter,
+//!   TCP 80 → HTTP filter, UDP/TCP 53 → fake DNS.
 //! * ip6tables: policy DROP, loopback only. No IPv6 egress at all.
 //!
-//! The proxy's uid is exempt, which is how its real DNS lookups and upstream
-//! connections leave. The agent runs as any other uid and cannot change
-//! these rules: it holds neither `NET_ADMIN` nor `NET_RAW`.
+//! Exemption is tied to socket cgroup membership, never uid: root in the
+//! agent may change Unix identity, but cannot enter the proxy's cgroup.
+//! The agent has a private, read-only cgroup hierarchy and no `SYS_ADMIN`,
+//! `NET_ADMIN`, or `NET_RAW`. The proxy needs a host cgroup namespace to
+//! discover its exact, non-root cgroup-v2 path; unsupported setups fail closed.
 
 use std::process::Command;
 
@@ -46,8 +48,7 @@ fn run(bin: &str, args: &[&str]) -> Result<()> {
 
 /// The complete rule set, in order. Pure, so it can be inspected in tests.
 #[allow(clippy::too_many_lines)] // it is a table
-pub fn rules(uid: u32, ports: Ports) -> Vec<(&'static str, Vec<String>)> {
-    let uid = uid.to_string();
+pub fn rules(cgroup: &str, ports: Ports) -> Vec<(&'static str, Vec<String>)> {
     let v4 = |args: &[&str]| {
         (
             "iptables",
@@ -139,29 +140,14 @@ pub fn rules(uid: u32, ports: Ports) -> Vec<(&'static str, Vec<String>)> {
             "ACCEPT",
         ]),
         v4(&[
-            "-A",
-            "OUTPUT",
-            "-m",
-            "owner",
-            "--uid-owner",
-            &uid,
-            "-j",
-            "ACCEPT",
+            "-A", "OUTPUT", "-m", "cgroup", "--path", cgroup, "-j", "ACCEPT",
         ]),
-        // Everything else from any other uid to any non-loopback destination is dropped by policy.
-        // --- IPv4 nat: transparent redirection for every uid but the proxy ---
+        // Every other cgroup is filtered, even if its process uid is root or
+        // equals the proxy uid. Identity changes cannot acquire exemption.
+        // --- IPv4 nat: transparent redirection outside the proxy cgroup ---
         v4(&["-t", "nat", "-A", "OUTPUT", "-o", "lo", "-j", "RETURN"]),
         v4(&[
-            "-t",
-            "nat",
-            "-A",
-            "OUTPUT",
-            "-m",
-            "owner",
-            "--uid-owner",
-            &uid,
-            "-j",
-            "RETURN",
+            "-t", "nat", "-A", "OUTPUT", "-m", "cgroup", "--path", cgroup, "-j", "RETURN",
         ]),
         v4(&[
             "-t",
@@ -231,9 +217,33 @@ pub fn rules(uid: u32, ports: Ports) -> Vec<(&'static str, Vec<String>)> {
     ]
 }
 
-/// Apply the rules. Must run as root with `CAP_NET_ADMIN`.
-pub fn apply(uid: u32, ports: Ports) -> Result<()> {
-    for (bin, args) in rules(uid, ports) {
+/// Parse the exact unified cgroup path visible in the host cgroup namespace.
+/// Never accept the hierarchy root: exempting it would exempt every agent.
+pub fn parse_cgroup(contents: &str) -> Result<&str> {
+    let mut paths = contents
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::/"));
+    let path = paths.next().context("cgroup v2 is required")?;
+    if paths.next().is_some()
+        || path.is_empty()
+        || path.len() > 4095
+        || path.chars().any(|c| c.is_control() || c.is_whitespace())
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        bail!("invalid/root cgroup path; start the sidecar with --cgroupns host");
+    }
+    Ok(path)
+}
+
+/// Apply the rules. Must run as root with `CAP_NET_ADMIN` in the host cgroup
+/// namespace. No uid-based or unsupported-kernel fallback is permitted.
+pub fn apply(ports: Ports) -> Result<()> {
+    let membership =
+        std::fs::read_to_string("/proc/self/cgroup").context("read cgroup membership")?;
+    let cgroup = parse_cgroup(&membership)?;
+    for (bin, args) in rules(cgroup, ports) {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         run(bin, &refs)?;
     }
@@ -245,9 +255,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rules_exempt_only_the_proxy_uid_and_redirect_the_three_ports() {
+    fn cgroup_requires_an_exact_non_root_unified_path() {
+        for valid in [
+            "system.slice/docker-012345.scope",
+            "docker/012345",
+            "user.slice/user-1000.slice/docker-012345.scope",
+        ] {
+            assert_eq!(parse_cgroup(&format!("0::/{valid}\n")).unwrap(), valid);
+        }
+        for invalid in [
+            "",
+            "0::/\n",
+            "1:net_cls:/docker/id\n",
+            "0::relative\n",
+            "0::/a/../b\n",
+            "0::/a/./b\n",
+            "0::/a//b\n",
+            "0::/a/\n",
+            "0::/a b\n",
+            "0::/a\t\n",
+            "0::/a\0b\n",
+            "0::/a\n0::/b\n",
+        ] {
+            assert!(parse_cgroup(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(parse_cgroup(&format!("0::/{}", "a".repeat(4096))).is_err());
+    }
+
+    #[test]
+    fn rules_exempt_only_the_proxy_cgroup_and_redirect_the_three_ports() {
         let r = rules(
-            65532,
+            "system.slice/docker-proxy.scope",
             Ports {
                 dns: 15053,
                 tls: 15443,
@@ -267,9 +305,12 @@ mod tests {
         assert!(joined.iter().any(|l| l == "iptables -t nat -F OUTPUT"));
         assert!(joined
             .iter()
-            .any(|l| l.contains("--uid-owner 65532 -j ACCEPT")));
+            .any(|l| l.contains("-m cgroup --path system.slice/docker-proxy.scope -j ACCEPT")));
         assert_eq!(
-            joined.iter().filter(|l| l.contains("--uid-owner")).count(),
+            joined
+                .iter()
+                .filter(|l| l.contains("-m cgroup --path "))
+                .count(),
             2
         );
         assert!(joined
@@ -292,12 +333,15 @@ mod tests {
         let redirect_at = joined.iter().position(|l| l.contains("REDIRECT")).unwrap();
         assert!(drop_at < redirect_at);
         // Every ACCEPT is one of: loopback interface, a redirected destination
-        // on one of our three ports, the proxy's uid, or an established reply.
+        // on one of our three ports, the proxy cgroup, or an established reply.
+        assert!(joined
+            .iter()
+            .all(|l| !l.contains("--uid-owner") && !l.contains("-m owner")));
         for l in joined.iter().filter(|l| l.contains("-j ACCEPT")) {
             assert!(
                 l.contains(" lo ")
                     || l.contains("-d 127.0.0.1 ")
-                    || l.contains("uid-owner")
+                    || l.contains("-m cgroup --path system.slice/docker-proxy.scope ")
                     || l.contains("conntrack"),
                 "unexpected ACCEPT: {l}"
             );
