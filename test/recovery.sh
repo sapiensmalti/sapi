@@ -7,6 +7,7 @@ S="$PWD/sapi"
 real_mv="$(command -v mv)"
 real_mkdir="$(command -v mkdir)"
 real_cat="$(command -v cat)"
+real_readlink="$(command -v readlink)"
 tmp="$(mktemp -d)"; tmp="$(cd "$tmp" && pwd -P)"
 writer=""
 cleanup() {
@@ -77,6 +78,21 @@ snapshot
 rm "$work/link"; ln -s $'target\n' "$work/link"
 run_sapi diff "$backup"
 check "diff detects a trailing-newline symlink retarget" grep -qx 'M  link' "$tmp/out"
+# BSD readlink adds a newline only if the target does not already end with
+# one. Reproduce that behavior on Linux too; -n must return the exact bytes.
+cat >"$tmp/shim/readlink" <<'SHIM'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -n ]]; then exec "$REAL_READLINK" "$@"; fi
+target="$("$REAL_READLINK" -n "$@" && printf .)" || exit 1
+target="${target%.}"
+printf '%s' "$target"
+if [[ "$target" != *$'\n' ]]; then printf '\n'; fi
+SHIM
+chmod +x "$tmp/shim/readlink"
+export REAL_READLINK="$real_readlink"
+PATH="$tmp/shim:$PATH" run_sapi diff "$backup"
+check "diff preserves target newlines with BSD readlink semantics" grep -qx 'M  link' "$tmp/out"
+rm "$tmp/shim/readlink"
 snapshot
 run_sapi diff "$backup"
 check "unchanged newline symlink compares equal" test "$rc" -eq 0

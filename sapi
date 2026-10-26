@@ -1318,11 +1318,11 @@ tree_manifest() { # $1 root, $2 output
         key="$(path_key "$rel")"
         raw="$(printf '%s' "$rel" | base64 | tr -d '\r\n')" || die "diff: cannot encode a path"
         if [[ -L "$absolute" ]]; then
-            # A sentinel preserves trailing target newlines in command
-            # substitution; strip only it and readlink's own final newline.
-            target="$(readlink "$absolute" && printf .)" || die "diff: cannot read link $rel"
+            # -n suppresses the output terminator on both GNU and BSD; a
+            # sentinel preserves any newlines belonging to the target itself.
+            target="$(readlink -n "$absolute" && printf .)" || die "diff: cannot read link $rel"
             target="${target%.}"
-            meta="link:$(path_key "${target%$'\n'}")"
+            meta="link:$(path_key "$target")"
         elif [[ -d "$absolute" ]]; then
             mode="$(file_mode "$absolute")" && meta="dir:$mode" || die "diff: cannot stat $rel"
         elif [[ -f "$absolute" ]]; then
