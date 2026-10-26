@@ -13,7 +13,11 @@ export DOCKER_CONFIG="${DOCKER_CONFIG:-$REAL_HOME/.docker}"
 export HOME="$test_root/home"; mkdir -p "$HOME"
 export SAPI_CONFIG_FILE="$HOME/config" SAPI_BACKUP_DIR="$HOME/backups"
 export SAPI_CONFIG_VOLUME="$TEST_ID-config" SAPI_IMAGE="sapi:$TEST_ID"
-EGRESS_CONTAINER="$TEST_ID-egress"; EGRESS_IMAGE="sapi-egress:$TEST_ID"
+EGRESS_CONTAINER="$TEST_ID-egress"
+# Release jobs can test an already-built candidate without rebuilding or
+# deleting it. Normal CI/developer runs continue to build this checkout.
+EGRESS_CANDIDATE="${SAPI_SMOKE_EGRESS_IMAGE:-}"
+EGRESS_IMAGE="${EGRESS_CANDIDATE:-sapi-egress:$TEST_ID}"
 PKG_IMAGE="sapi:$TEST_ID-pkg"; PROBE_IMAGE="sapi:$TEST_ID-probe"
 SHELL_CONFIG="$TEST_ID-shell-config"; SHELL_SESSIONS="$TEST_ID-shell-sessions"
 unset SAPI_PACKAGES SAPI_DOCKERFILE_EXTRA SAPI_NETWORK SAPI_ALLOW SAPI_MODEL SAPI_REBUILD SAPI_AUTO_UPDATE
@@ -37,7 +41,8 @@ cleanup() {
             --mount "type=bind,source=$test_root,target=/test-fixtures" --entrypoint /bin/sh \
             "$SAPI_IMAGE" -c 'find /test-fixtures -mindepth 1 -delete' >/dev/null 2>&1
     fi
-    docker image rm -f "$PROBE_IMAGE" "$PKG_IMAGE" "$SAPI_IMAGE" "$EGRESS_IMAGE" >/dev/null 2>&1
+    docker image rm -f "$PROBE_IMAGE" "$PKG_IMAGE" "$SAPI_IMAGE" >/dev/null 2>&1
+    [[ -z "$EGRESS_CANDIDATE" ]] && docker image rm -f "$EGRESS_IMAGE" >/dev/null 2>&1
     rm -rf -- "$test_root"
     exit "$rc"
 }
@@ -95,7 +100,14 @@ grep -q 'probe: update root uid=0 gid=0' "$test_root/probe.err" \
     && ok 'pi update also runs as root' || bad "updater: $(cat "$test_root/probe.err")"
 
 echo 'egress allowlist'
-if docker build -q -f egress/Dockerfile -t "$EGRESS_IMAGE" egress >/dev/null; then ok 'sidecar builds'; else bad 'sidecar build'; exit 1; fi
+if [[ -n "$EGRESS_CANDIDATE" ]]; then
+    docker image inspect "$EGRESS_IMAGE" >/dev/null || { bad 'release candidate image is missing'; exit 1; }
+    ok "testing existing sidecar candidate $EGRESS_IMAGE"
+elif docker build -q -f egress/Dockerfile -t "$EGRESS_IMAGE" egress >/dev/null; then
+    ok 'sidecar builds'
+else
+    bad 'sidecar build'; exit 1
+fi
 docker run -d --name "$EGRESS_CONTAINER" --init --read-only --cgroupns host \
     --tmpfs '/run:rw,noexec,nosuid,nodev,size=1048576,mode=755' \
     --security-opt no-new-privileges --cap-drop ALL --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \

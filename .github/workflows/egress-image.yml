@@ -30,11 +30,15 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: build and push by digest
+      - name: build, test exact candidate, and push by digest
         id: build
         run: |
-          docker build -f egress/Dockerfile -t "$IMAGE:${GITHUB_REF_NAME}-${{ matrix.arch }}" egress
-          docker push "$IMAGE:${GITHUB_REF_NAME}-${{ matrix.arch }}"
+          candidate="$IMAGE:${GITHUB_REF_NAME}-${{ matrix.arch }}"
+          docker build -f egress/Dockerfile -t "$candidate" egress
+          before="$(docker image inspect --format '{{.Id}}' "$candidate")"
+          SAPI_SMOKE_EGRESS_IMAGE="$candidate" test/smoke.sh
+          test "$(docker image inspect --format '{{.Id}}' "$candidate")" = "$before"
+          docker push "$candidate"
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:${GITHUB_REF_NAME}-${{ matrix.arch }}" | cut -d@ -f2)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "$digest" > "digest-${{ matrix.arch }}"
