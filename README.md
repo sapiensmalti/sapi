@@ -4,6 +4,8 @@
 
 [pi](https://github.com/earendil-works/pi) in Docker, scoped to the directory you run it from.
 
+**Version note:** this page describes `main`. Root-only execution and cgroup-based allowlisting are not in the installer's selected sapi release (`v0.6.1`); use the explicit development install below to get these changes.
+
 sapi mounts the current directory at `/workspace`. Agents, pi updates, and shells run as **root inside their own containers** on every platform. Credentials, settings, and session history live in Docker volumes. It does not mount your home directory, SSH agent, or Docker socket by default.
 
 **The workspace remains writable and network access is unrestricted by default.** On Linux, newly created files may be root-owned; sapi does not silently repair host ownership. Credentials and pi settings are shared across projects unless you choose a separate config volume. Read the [security model](docs/security.md) before running untrusted code.
@@ -17,10 +19,12 @@ Requirements: macOS or Linux, Bash, `curl`, standard Unix tools, and Docker 23+ 
 - Check that `docker info` works as your normal user. Docker group membership grants root-equivalent host access.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/sapiensmalti/sapi/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sapiensmalti/sapi/main/install.sh | SAPI_REF=main bash
 cd /path/to/project
 sapi
 ```
+
+The command above opts into `main`; omitting `SAPI_REF=main` installs the selected release instead.
 
 The installer copies one executable to `~/.local/bin`, without sudo or shell-profile edits. If needed, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile. You can [read the installer](install.sh) before running it.
 

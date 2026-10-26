@@ -15,14 +15,14 @@ readonly CONFIG_VOLUME="${SAPI_CONFIG_VOLUME:-sapi-config}"
 readonly LABEL="sh.sapi"
 
 # Egress sidecar (network = allowlist). A cgroup-v2 readiness marker is
-# mandatory; legacy UID-exempt images fail closed until pins are refreshed.
+# mandatory; legacy UID-exempt images are always refused.
 # Pinned by digest; the source tarball of the same tag is pinned by checksum for SAPI_EGRESS_BUILD=1. Both are
 # produced by .github/workflows/egress-image.yml from egress/ in this repo.
-readonly EGRESS_VERSION="0.1.2"
+readonly EGRESS_VERSION="0.1.3"
 readonly EGRESS_UID="65532"
-readonly EGRESS_IMAGE="${SAPI_EGRESS_IMAGE:-ghcr.io/sapiensmalti/sapi-egress@sha256:fca853b3474b951ba13280e1e14911986b5c99b4dde0505042be2a4886fcd8ef}"
+readonly EGRESS_IMAGE="${SAPI_EGRESS_IMAGE:-ghcr.io/sapiensmalti/sapi-egress@sha256:467f77d70e4f914a5ae12650431c1f01164af85b088345134da083bb2477f3ae}"
 readonly EGRESS_SOURCE_URL="https://github.com/sapiensmalti/sapi/releases/download/egress-v$EGRESS_VERSION/sapi-egress-src-$EGRESS_VERSION.tar.gz"
-readonly EGRESS_SOURCE_SHA256="51c4d663122901978952a03b16fa7b209ebb819a1780292565f207abdc0da762"
+readonly EGRESS_SOURCE_SHA256="63520a42933bcee1a1cff7d1e394d544aa42b558ce7053def82046ff63b8fb1c"
 readonly EGRESS_LOCAL_IMAGE="sapi-egress:$EGRESS_VERSION"
 
 # ---------------------------------------------------------------------------

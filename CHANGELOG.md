@@ -6,7 +6,7 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 - Fail closed on invalid environment overrides; preserve intentionally empty config lists and return `2` for all diff validation failures.
 - Enforce container root (`0:0`) for every managed agent, pi updater, and shell on all platforms. Reject non-root identity requests, override conflicting Docker user/entrypoint flags, and verify real root credentials at the entrypoint. Linux workspace files may consequently be root-owned.
-- Replace proxy-UID firewall exemptions with exact cgroup-v2 membership; require compatible readiness and fail closed on legacy images/unsupported kernels. Publishing the new verified sidecar pins remains a release gate.
+- Replace proxy-UID firewall exemptions with exact cgroup-v2 membership; require compatible readiness and fail closed on legacy images/unsupported kernels. Pin sapi-egress 0.1.3 by verified image digest and source checksum; gate each architecture's publication on exact-image kernel smoke tests.
 - Add production-profile probes for root updates, workspace writes, conflicting user flags, cgroup isolation, and network enforcement after deliberate child-UID changes.
 - Publish readiness atomically; use server-assigned ephemeral ports in Rust integration tests instead of close-and-rebind port probes, and clean up child processes/readiness files on test failure.
 

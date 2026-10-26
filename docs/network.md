@@ -4,8 +4,6 @@ Network access is **unrestricted by default**. Opt-in allowlist mode restricts t
 
 Agents remain root. The proxy's exemption is tied to its **cgroup-v2 membership**, not its uid, so changing an agent child's Unix identity does not bypass policy. Allowlist mode requires a cgroup-v2 Docker host with per-container `systemd`/`cgroupfs` isolation and the iptables cgroup matcher; disabled/shared cgroup configurations and unsupported kernels fail closed.
 
-**Review-branch release gate:** the new cgroup sidecar is not yet published/pinned. The launcher deliberately rejects the old UID-exempt release image. CI builds the new source locally; the default allowlist must not be considered ready to ship until kernel tests pass and the verified new image/source pins are published.
-
 ```sh
 sapi config set allow "@providers @github @npm"
 sapi config set network allowlist
@@ -71,6 +69,6 @@ Parsed DNS/TLS/HTTP decisions are JSON lines containing the available hostname, 
 
 ## Sidecar source and verification
 
-Release sidecars are digest-pinned; matching source archives are checksum-pinned. The launcher additionally requires the `cgroup-v2` readiness protocol so an old UID-exempt image cannot silently authorize a root agent. `SAPI_EGRESS_BUILD=1 sapi` builds from that source locally instead of pulling the image. This still requires network access for build inputs. `SAPI_EGRESS_IMAGE` is an explicit trust override. See [the release workflow](../.github/workflows/egress-image.yml) and [`egress/`](../egress).
+Release sidecars are digest-pinned; matching source archives are checksum-pinned. The release workflow kernel-tests each architecture's exact candidate image before publishing it. The launcher additionally requires the `cgroup-v2` readiness protocol so an old UID-exempt image cannot silently authorize a root agent. `SAPI_EGRESS_BUILD=1 sapi` builds from that source locally instead of pulling the image. This still requires network access for build inputs. `SAPI_EGRESS_IMAGE` is an explicit trust override. See [the release workflow](../.github/workflows/egress-image.yml) and [`egress/`](../egress).
 
 CI tests launcher/recovery behavior in Debian 12/13 userspaces without a Docker socket. Separate real Docker smoke tests on Linux and macOS exercise allowed/denied destinations, firewall permissions, restart readiness, read-only sidecar storage, and logs. Rust tests cover parsers, address filtering, firewall rules, and relays. Test-only bypass flags are excluded from the production build.
