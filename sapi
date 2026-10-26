@@ -2,7 +2,7 @@
 # sapi — the pi coding agent, isolated in Docker, scoped to the directory you run it from.
 # https://github.com/sapiensmalti/sapi
 #
-# One file. No dependencies beyond bash, docker and coreutils.
+# One launcher file. Requires Bash, Docker, curl and standard Unix tools.
 set -Eeuo pipefail
 
 readonly SAPI_VERSION="0.6.1"
@@ -137,24 +137,25 @@ Usage:
                      Start (or resume) an agent in the current directory
   sapi run [--json] [--timeout S] TASK
                      Headless: one task, final message on stdout, agent's exit code ('-' reads TASK from stdin)
-  sapi backup        Back up this directory now (what --safer does before every start)
+  sapi backup        Back up this directory now (--safer does this before an agent start)
   sapi backups       List this directory's backups
   sapi diff [BACKUP] [--full]
                      What changed since the latest (or given) backup: A/M/D per path; --full for a unified diff
   sapi restore FILE|latest [DEST]
-                     Restore a backup into DEST (default: a new sibling directory; never in place)
+                     Restore a backup into a new or empty DEST (default: a new sibling directory)
   sapi restore FILE|latest --files PATH...
                      Put back only the named paths, in place
   sapi config [show | set KEY VALUE | keys | path]
                      Show or change persistent settings
   sapi ls            List sapi containers
-  sapi rm [--all]    Remove this directory's containers (or all of them)
+  sapi rm [--all]    Stop/remove this directory's containers and delete its session volumes
+                     (--all: all managed projects; config volumes, backups and images stay)
   sapi shell [NAME] [--net]
-                     A shell in /pi-sessions (session files) with /pi-config beside it; joins the running
-                     agent, or starts an ephemeral container with the same volumes (no network unless --net)
-  sapi netlog [NAME] Egress decisions (allow/deny, JSON lines) when network = allowlist
+                     Bash in /pi-sessions: join a running agent (inherit its network/mounts),
+                     or start a temporary shell (no network unless --net; then full network)
+  sapi netlog [NAME] Print available egress-sidecar logs when using allowlist mode (does not follow)
   sapi build         Build the image without starting a container
-  sapi dockerfile    Print the embedded Dockerfile
+  sapi dockerfile    Print the effective Dockerfile, including user customizations
   sapi upgrade       Upgrade sapi itself
   sapi version       Print version
   sapi help          Show this help
@@ -168,7 +169,7 @@ Environment:
   SAPI_CONFIG_VOLUME  Docker volume for pi config and credentials (default: sapi-config)
   SAPI_ENV            Space-separated host variables to pass through, e.g. "ANTHROPIC_API_KEY GH_TOKEN"
   SAPI_DOCKER_ARGS    Extra arguments for 'docker create' (split on whitespace)
-  SAPI_SAFER=1        Back up the directory before every start; abort if that fails
+  SAPI_SAFER=1        Back up before interactive/headless agent starts; abort if that fails
   SAPI_BACKUP_DIR     Where backups go (default: ~/.local/share/sapi/backups); must be outside the directory
   SAPI_BACKUP_KEEP    Backups to keep per directory (default: 10; 0 = keep all)
 
@@ -185,7 +186,8 @@ Config file ($CONFIG_FILE), 'key = value' ('sapi config keys' lists them):
 $(setting_help)
 Precedence: flag > environment > config file > default.
 
-Inside the agent:  detach with Ctrl-P, Ctrl-Q.  Reattach with 'sapi'.
+Inside the agent:  Ctrl-P, Ctrl-Q detaches without stopping it.
+Use 'sapi ls', then 'docker attach NAME' to reattach; another 'sapi' creates another agent.
 Docs: https://github.com/$SAPI_REPO
 EOF
 }
@@ -290,7 +292,7 @@ setting_spec() {  # $1 key -> "type env default"
 }
 setting_help() {
     cat <<'HELP'
-  safer        bool    back up the directory before every start; abort if that fails
+  safer        bool    back up before interactive/headless agent starts; abort if that fails
   backup_dir   path    where backups go (absolute; must be outside the directory)
   backup_keep  uint    backups kept per directory (0 = keep all)
   cpus         number  CPU ceiling for the agent container (0 = unlimited)
@@ -299,7 +301,7 @@ setting_help() {
   packages     list    extra Debian packages baked into the image, e.g. "golang make postgresql-client"
   dockerfile_extra path  Dockerfile fragment appended to the image when the file exists
                        (default: ~/.config/sapi/Dockerfile.extra; user-level only, never from a project)
-  network      enum    full (default) | allowlist — only hosts in 'allow' are reachable, on 80/443
+  network      enum    full (default) | allowlist — hostname filter on 80/443; root-agent limitations apply
   allow        list    hosts for network = allowlist: host, *.suffix, host:port, or presets
                        @providers @github @npm @pypi @cargo @go @debian @huggingface  (default: @providers)
 HELP
@@ -1009,8 +1011,8 @@ cmd_upgrade() {
         curl -fsSL "$url" | env SAPI_REF="$SAPI_REF" SAPI_INSTALL_DIR="$dir" bash
     else
         # The installed script is pinned to its own release; using that ref
-        # here would pin upgrades to the past. The current installer selects
-        # the newest release tag. SAPI_REF=main explicitly tracks development.
+        # here would pin upgrades to the past. The current installer carries
+        # the selected release tag. SAPI_REF=main explicitly tracks development.
         local url="https://raw.githubusercontent.com/$SAPI_REPO/main/install.sh"
         log "fetching $url"
         curl -fsSL "$url" | SAPI_INSTALL_DIR="$dir" bash

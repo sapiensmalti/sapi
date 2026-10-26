@@ -10,6 +10,7 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 - Preserve newline-containing parent components during selective restore; add deterministic recovery-failure and concurrency regression tests.
 - Clarify backup consistency limits, per-selection restore transactions, and interrupted-recovery instructions.
 - Add Debian 12/13 launcher/recovery CI alongside existing Linux/macOS coverage; use Debian-first installation guidance with a current Docker Engine and Buildx plugin.
+- Simplify the README and guides, add a configuration reference, and align help text with attachment, shell-network, cleanup, timeout, and logging behavior.
 
 ## [0.6.1] - 2026-10-25
 

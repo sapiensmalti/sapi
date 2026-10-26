@@ -1,169 +1,115 @@
-# Recovery: backup → run → diff → restore
+# Backup, run, diff, restore
 
-The sandbox stops the agent from touching anything *outside* the directory you run `sapi` in. It does nothing about what happens *inside* it. This page is about the inside: how to always be able to see what the agent did and to take it back — interactively, or unattended from a cron job.
+The container limits host access; it does not prevent damage inside the mounted workspace. Safer mode takes a backup before an agent start. Diff and restore work without git.
 
-Four commands, one loop:
-
-| | Command | What you get |
-|---|---|---|
-| **before** | `sapi --safer` / `sapi config set safer true` | a complete, checksummed backup, taken immediately before the agent gets access |
-| **during** | `sapi run TASK` | one headless task; final message on stdout; the agent's exit code |
-| **after** | `sapi diff` | every path added, modified or deleted since the backup; `--full` for the hunks |
-| **undo** | `sapi restore latest --files PATH…` / `sapi restore latest` | put back selected files in place, or the whole tree beside the original |
-
-## Safer mode
-
-Three ways to enable it, in order of precedence (higher wins):
-
-```sh
-sapi --safer                 # this run only  (--no-safer forces it off)
-SAPI_SAFER=1 sapi            # this shell
-sapi config set safer true   # always, for this user
-```
-
-`sapi config show` prints every effective setting and where it came from.
-
-### What a backup is
-
-A `tar.gz` of the whole directory, taken from its parent, so the archive contains `<dirname>/…`. Symlinks are stored as symlinks. Modes and timestamps are preserved. Nothing is excluded — not `.git`, not `node_modules`, not `.env`. A backup that leaves things out is not a backup.
-
-It is stored **outside** the directory, where the agent cannot reach it:
-
-```
-~/.local/share/sapi/backups/<dirname>-<hash>/
-    20261025T074811Z.tar.gz            the archive            (mode 0600)
-    20261025T074811Z.tar.gz.sha256     checksum, sha256sum -c format
-    20261025T074811Z.tar.gz.manifest   source, time, size, entry count, sha256, tar exit code, duration
-    20261025T074811Z.tar.gz.run        (after `sapi run`) task, container, start/finish, exit code, model
-```
-
-`<hash>` is derived from the absolute path, so two directories with the same name never share a folder. Names are UTC timestamps and sort chronologically; a same-second collision waits for the next second rather than adding a suffix. Change the root with `SAPI_BACKUP_DIR` or `backup_dir`.
-
-### How it is made
-
-1. **Preconditions**: `tar` exists; the directory is not `/`; the backup root is not inside the directory (checked textually *and* after resolving symlinks); its permissions are enforced to 0700; directory measurement and the free-space check must succeed. A portable `mkdir` lock refuses a concurrent backup for the same project. Recovery of a known-dead owner is serialized and ownership rechecked; missing or malformed ownership fails closed ([troubleshooting](troubleshooting.md)).
-2. `tar -czf` into a private transaction directory. GNU tar's exit 1 ("file changed as we read it") is recorded as a warning in the manifest; anything worse aborts.
-3. The archive is re-read in full (`tar -tzf`) to prove it is readable and non-empty.
-4. SHA-256 and metadata are completely written, then the archive is renamed into place as the commit point. A crash can leave harmless orphan sidecars, cleaned by a later backup, never an apparently complete archive with half-written metadata.
-5. Backups beyond `backup_keep` (default 10; `0` = keep all) are pruned with their checksum/manifest/run sidecars, oldest first.
-
-On an ordinary error or caught signal, **the launch is aborted** and cleanup is attempted. Power loss or `SIGKILL` cannot run cleanup; an incomplete lock or interrupted lock recovery may need inspection. The container is created only after step 5. This is not a filesystem snapshot: other programs can change the directory during archiving or before the agent starts.
-
-## `sapi run`: headless
-
-```sh
-sapi run "Update CHANGELOG.md from the git log since the last tag."
-sapi run --timeout 900 "Fix every failing test in packages/api."
-echo "Summarise this repository in 10 lines." | sapi run -
-sapi run --json "…" > events.jsonl          # pi's full event stream instead of the final message
-```
-
-- One ephemeral container (`--rm`), the same mounts, hardening and resource ceilings as interactive mode.
-- Final assistant message on **stdout**; sapi's own progress on **stderr**; exit code = the agent's exit code (`124` on `--timeout`).
-- Project-local pi files (`.pi/`) are **not** trusted (`--no-approve`): an unattended run must not pick up extensions from the tree it is editing.
-- No TTY required. It composes with everything: pipes, `xargs -P`, Makefiles, CI, cron.
-
-### Resource ceilings
-
-Both modes honour `cpus`, `memory_mib` and `pids` (`SAPI_CPUS`, `SAPI_MEMORY_MIB`, `SAPI_PIDS`, or the config file). Defaults: unlimited, unlimited, 4096 processes. A confused agent running a fork bomb or an unbounded build should not take the host down with it.
-
-## `sapi diff`: what changed
-
-```
-$ sapi diff
-M  src/auth/session.ts
-A  src/auth/session.test.ts
-D  src/auth/legacy.ts
-sapi: diff: 1 added, 1 modified, 1 deleted · vs 20261025T074811Z.tar.gz · run exit 0
-```
-
-Compares the directory **now** against the latest backup (or a given one: `sapi diff FILE`). If a checksum sidecar exists it must match; a missing one produces an explicit unverified-integrity warning. `--full` appends unified hunks for regular files (`--- backup/…`, `+++ now/…`). Exit status follows `diff(1)`: `0` no changes, `1` changes, `2` error; caught signals retain their usual exit statuses. Automation can distinguish a changed tree from a failed comparison.
-
-The comparison uses private manifests of content hashes, file types, permission modes, and symlink targets. A chmod, type change, or same-content symlink retarget is therefore a modification, including targets that differ only by trailing newlines. It never recursively follows symlinks, and unusual/control-character paths are escaped rather than interpreted.
-
-It needs no git. It works when the project is not a repository, when `.git` itself was deleted, and for files git would ignore.
-
-## `sapi restore`: take it back
-
-```sh
-sapi restore latest --files src/auth/legacy.ts src/auth/session.ts   # just these, in place
-sapi restore latest                                                 # whole tree → ../<dirname>.restored-<stamp>/
-sapi restore FILE /some/empty/dir                                   # whole tree → there
-```
-
-- Restore verifies an available checksum and refuses a corrupt archive; missing/invalid metadata is never presented as verified. Archives must have one top-level directory and no absolute/parent-traversing members. **Restore only archives you trust: a checksum proves integrity, not authorship.**
-- **Whole-tree restore defaults to a new sibling directory.** An explicit destination must be new or empty. It stages a complete tree beside the destination and moves it into place; failure does not leave a half-extracted destination.
-- **`--files` is the only in-place operation**, and it touches exactly the paths you name — relative, inside the directory, present in the backup; parent traversal and absolute paths are refused, while a name such as `a..b` is valid.
-- Each selected path is staged beside its destination and swapped in without following destination symlinks. **Selecting a directory replaces that directory exactly**: files created beneath it since the backup are removed. Unrelated paths are untouched. Selections are processed in order, not as one transaction; an earlier successful selection remains restored if a later one fails.
-- On a failed swap or caught signal, sapi attempts to put the saved original back. If rollback fails or the destination has reappeared, it retains the original at `.sapi-restore.*/old` and prints its location. Inspect it before retrying; never delete that directory until the original is safe. Stop agents and other writers before restoring.
-- Everything is standard tar: you can inspect an archive with `tar -tzf FILE` without sapi.
-
-## Unattended: auditable and reversible by construction
-
-Put safer mode and `run` together and every automated task leaves a complete, independent record:
-
-```sh
-# crontab: nightly, 15-minute budget, logs kept with the backups
-0 2 * * *  mkdir -p "$HOME/.local/share/sapi" && cd "$HOME/code/service" && \
-             SAPI_SAFER=1 "$HOME/.local/bin/sapi" run --timeout 900 \
-             "Review yesterday's commits for security issues; fix trivial ones; summarise the rest in REVIEW.md" \
-             >> "$HOME/.local/share/sapi/service-cron.log" 2>&1
-```
-
-What exists the next morning, for that one run, all outside the agent's reach:
-
-| Artifact | Answers |
+| Task | Command |
 |---|---|
-| `<stamp>.tar.gz` + `.sha256` + `.manifest` | *What did the tree look like before?* — complete, verified, restorable |
-| `<stamp>.tar.gz.run` | *What was it asked, when, how long, which model, how did it exit?* |
-| `service-cron.log` (stdout + stderr) | *What did it say?* — its final message, plus sapi's own lines |
-| `sapi diff <stamp>.tar.gz` | *What did it actually change?* — every path, with hunks on request |
-| `sapi restore <stamp>.tar.gz --files …` | *Undo exactly that* — one file or the whole tree, without touching anything else |
-| `sapi shell` → `/pi-sessions-runs/*.jsonl` | *Every message, tool call and result of the run* — pi's own session file, in a shell with no network |
+| Back up before starting | `sapi --safer` or `sapi --safer run TASK` |
+| Back up without starting | `sapi backup` |
+| List this workspace's backups | `sapi backups` |
+| Compare with the latest backup | `sapi diff` or `sapi diff --full` |
+| Restore selected paths in place | `sapi restore latest --files PATH...` |
+| Restore the whole tree beside the workspace | `sapi restore latest` |
 
-Each night's run gets its own backup, so the chain of backups is a chain of before-states; `backup_keep` bounds how far back it reaches. This is auditability (every input and output of the run is recorded, independently of the agent and independently of git) and reversibility (any subset of its effects can be undone, verified against a checksum) — with zero cooperation required from the agent, the model, or the repository.
+**Stop agents and other writers before diff or restore.** Detaching with Ctrl-P, Ctrl-Q leaves the agent running. Use `sapi ls` to find it and `docker stop NAME` to stop it.
 
-A review workflow that fits in one line:
+## Safer mode and backups
 
 ```sh
-sapi diff >/dev/null || { sapi diff --full | less; }     # anything changed? show me
+sapi --safer                         # this invocation
+sapi config set safer true           # subsequent agent starts, including run
+sapi --no-safer run "Explain this project."   # override the saved setting
 ```
 
-## Config file
+Use valid config/environment values: malformed environment overrides are a [known validation limitation](configuration.md#config-file). An explicit `--safer` flag takes precedence over `SAPI_SAFER`.
 
-`~/.config/sapi/config` (or `$XDG_CONFIG_HOME/sapi/config`; override with `SAPI_CONFIG_FILE`):
+A backup contains the whole workspace: `.git`, hidden files, build output, secrets, and symlinks. It is a `tar.gz` with one top-level directory. Filesystem modes and timestamps are stored; this is not a filesystem snapshot or a record of every filesystem attribute.
 
-```
-# sapi settings
-safer = true
-backup_dir = /Volumes/External/sapi-backups
-backup_keep = 10
-cpus = 4
-memory_mib = 8192
-pids = 4096
-```
+Backups live outside the workspace, by default under `~/.local/share/sapi/backups/<dirname>-<path-hash>/`. Override the root with `backup_dir` / `SAPI_BACKUP_DIR`. The directory is mode 0700 and archive/metadata files are 0600. Archives are not encrypted or off-site.
 
-Rules: `key = value`, full-line `#` comments, lower-case keys (`sapi config keys` lists them with their types), booleans as `true/false/yes/no/on/off/1/0`, paths absolute, counts non-negative integers. `#` elsewhere is literal, so paths such as `/tmp/a#b` round-trip unchanged. The file is parsed, never sourced. An unknown key or invalid value makes sapi refuse to start — a safety setting silently ignored because of a typo would be worse than no setting at all. `sapi config set` writes the file atomically with mode 0600 and preserves other lines.
-
-## Costs and limits
-
-- **Time and disk.** A backup of a directory with a large `node_modules` or build output takes as long as tarring it. Each run adds one archive; pruning bounds the count, not the size. Put `backup_dir` on a volume with room.
-- **Not a snapshot.** Concurrent writes can produce a mixed-time or mid-write backup. GNU tar may warn (`tar_exit = 1`), but cannot detect every change. Stop other writers when you need a stable tree; keep the directory still during diff or restore too.
-- **Secrets travel with it.** The archive contains whatever the directory contains. It is `0600` in a `0700` folder; it is not encrypted.
-- **Not off-site.** The backup lives on the same machine. It protects against the agent, not against the disk.
-- **`diff` extracts and hashes the backup and current tree** in private temporary storage; for very large trees that costs I/O and `$TMPDIR` space. Selective restore also stages the archive before swapping selected paths. `TMPDIR` must be outside the workspace.
-
-## `sapi shell`: where pi keeps its files
-
-```
-$ sapi shell
-  /pi-config          pi settings, auth.json, extensions, gitconfig  (volume sapi-config)
-  /pi-sessions        session files (*.jsonl) of the interactive agent  (volume sapi-<dir>-<hash>-sessions)
-  /pi-sessions-runs   session files of `sapi run`  (volume sapi-<dir>-<hash>-runs-sessions)
-  /workspace          /home/you/code/project
-sapi@sapi:/pi-sessions$ ls -t | head
+```text
+20261025T074811Z.tar.gz             archive
+20261025T074811Z.tar.gz.sha256      checksum
+20261025T074811Z.tar.gz.manifest    source, time, version, size, entries, tar result
+20261025T074811Z.tar.gz.run         headless-run summary, when written
 ```
 
-One command, no prerequisites. If an agent for this directory is running you are placed inside it; otherwise an ephemeral container with the same hardening and the same volumes is started — and removed when you leave. Ephemeral shells have **no network** unless you pass `--net`: a shell with the credentials volume mounted should not have egress by accident. On Linux the shell runs as your uid, like the agent, so anything you create is yours. `sapi shell NAME` targets a specific container's sessions.
+Before starting the selected agent, sapi checks that the backup location is outside the workspace, acquires a per-workspace lock, checks space, writes the archive, rereads its listing, and calculates its SHA-256. Metadata is written before the archive is renamed into place. Failure aborts the new agent start; it does not stop other agents already running.
 
-Session files are pi's own record of every message, tool call and result — the finest-grained audit trail there is. `jq -c 'select(.type == "message_end") | .message.role' *.jsonl` is a good first look; see pi's [session format](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/session-format.md).
+GNU tar's exit 1 is accepted with a warning and recorded in the manifest; higher exit codes abort. Concurrent writes may produce a mixed-time or mid-write backup, and tar cannot detect every change. Keep other writers stopped when you need a stable tree.
+
+`backup_keep` defaults to 10 archives per workspace; `0` keeps all. Pruning removes the oldest archives and their metadata. This bounds the number of backups, not their total size. Names are UTC timestamps; same-second collisions wait for the next second.
+
+Known-dead lock owners can be recovered automatically. Missing/malformed ownership or interrupted lock recovery fails closed; see [troubleshooting](troubleshooting.md). Normal errors and caught signals attempt cleanup. Power loss and `SIGKILL` cannot run cleanup, and rename ordering is not a guarantee of power-loss durability.
+
+## Headless tasks
+
+```sh
+sapi --safer run --timeout 900 "Run the tests and fix the failures."
+printf '%s\n' "Summarise this project." | sapi run -
+sapi run --json "Explain the test failures." > events.jsonl
+```
+
+- Each task uses a new, automatically removed container. Its session files use a persistent per-workspace volume.
+- Default stdout is pi's final message; `--json` selects pi's event stream. Sapi diagnostics go to stderr.
+- Normal exit status is the agent/container's result. A timeout returns `124`; caught signals keep their usual statuses.
+- `--timeout S` begins after container launch, includes container startup/update time, and does **not** cover the preceding image build, backup, or sidecar setup. Stopping the container can add a grace period. `0` means no timeout.
+- Sapi passes pi `--no-approve` to ignore project-local resources for the run. This is not a tool-approval mechanism or protection from prompt injection in files the agent reads.
+
+With safer mode, a normally completed `run` writes a `.run` summary beside its backup, including nonzero exits and timeouts. It contains the task's first 2,000 bytes with newlines flattened, the container, timestamps, exit code, requested model (or `default`), and sapi version. An interrupted run may leave a backup without a run summary. Redirect output to a file outside the workspace if you also need a host-side record of stdout/stderr; it may contain secrets.
+
+These artifacts aid review, but are not a tamper-proof audit log. Session files are writable by the agent, and diff compares the current tree, not a saved after-state attributable to one run. Later edits or concurrent tasks affect the comparison.
+
+## Diff
+
+```sh
+sapi diff                            # latest backup for this workspace
+sapi diff /path/to/backup.tar.gz --full
+```
+
+Output lists `A`dded, `M`odified, and `D`eleted paths. Regular files are compared by content hash and mode; directories by mode; symlinks by target without following them. Other special files are identified by type. Timestamps, ownership, ACLs, and extended attributes are not compared. Control-character paths are escaped for display.
+
+`--full` adds unified hunks for regular files. No git repository is needed, and git-ignored files are included. Comparison exit status: **0 unchanged, 1 changes, 2 error**; caught signals retain their usual statuses. There is a current exception: early config-file validation errors also return `1`, so that status alone does not always prove there were differences.
+
+Diff verifies an available checksum sidecar; a missing checksum produces a warning. It extracts the backup and hashes both trees, so large workspaces need time and temporary disk space. `$TMPDIR` must be outside the workspace. Restore or diff only archives you trust: a checksum detects corruption, not malicious authorship.
+
+## Restore
+
+```sh
+sapi restore latest --files src/main.rs README.md
+sapi restore latest                         # new sibling: <workspace>.restored-<UTC stamp>
+sapi restore /path/to/backup.tar.gz /some/new-or-empty-directory
+```
+
+An explicit archive can replace `latest` in either mode. Restore verifies an available checksum and checks for one top-level directory with no absolute or parent-traversing member names. Missing checksums are reported as unverified.
+
+**Whole-tree restore** stages the extracted tree beside a new or empty destination, then moves it into place. The default destination is a sibling of the workspace; a nonempty destination is refused.
+
+**Selected restore** writes into the workspace. Paths must be relative, present in the backup, and contain no `..` component. Quote filenames containing spaces or shell metacharacters. Destination symlink parents are refused; selecting a symlink replaces the link, not its target. **Selecting a directory replaces the directory exactly**, removing additions made since the backup. It is not a merge.
+
+Each selected item is staged beside its destination before replacement. Selections are processed in order, not as one transaction: earlier successful selections remain restored if a later one fails. On a failed swap or caught signal, sapi attempts rollback. If it cannot safely restore the original, it preserves it at `.sapi-restore.*/old` and prints that path. Recover it before deleting the staging directory or retrying.
+
+Standard tar tools remain available for inspection or recovery: `tar -tzf FILE` lists an archive.
+
+## Sessions and shells
+
+`sapi shell [NAME]` opens Bash in `/pi-sessions` and requires an interactive terminal. Its behavior depends on whether an agent is running:
+
+| Situation | Shell behavior |
+|---|---|
+| Running agent for this workspace | Join it; inherit its network, mounts, and passed environment. |
+| No selected running agent | Create a temporary shell with the config and selected session volumes; no network by default. |
+| Temporary shell with `--net` | Use Docker's default network, not the configured agent allowlist. |
+
+`--net` does not change a running agent's network. Shells always expose the mounted workspace and config volume; they are not read-only viewers. If several agents are running, use `sapi shell NAME` to choose one.
+
+| Path | Data |
+|---|---|
+| `/workspace` | Current project |
+| `/pi-config` | Shared pi credentials, settings, extensions, and gitconfig |
+| `/pi-sessions` | Selected agent slot's session files (`NAME-sessions` volume) |
+| `/pi-sessions-runs` | Headless-run session files, mounted in a temporary shell if that workspace's run volume exists |
+
+A shell joining a running interactive agent does not add the headless-run volume. Session records are pi's JSONL format, not the same as `run --json` events. Inside a shell, `ls -lt /pi-sessions` locates them; for a chosen file, `jq -c 'select(.type == "message") | .message.role' FILE.jsonl` lists recorded message roles.
+
+`sapi rm` stops/removes this workspace's containers and deletes its session volumes, including headless-run history. `--all` applies to all managed projects. Config volumes, workspace files, backups, and images remain. See [configuration](configuration.md) for custom config volumes and resource limits.

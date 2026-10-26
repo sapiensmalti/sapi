@@ -1,85 +1,78 @@
 # Troubleshooting
 
-**`sapi: docker not found`**
-Install Docker 23+ with Buildx. macOS: `brew install orbstack` (or Docker Desktop). Debian: follow [Docker's installation guide](https://docs.docker.com/engine/install/debian/); the distribution's `docker.io` package may be too old.
+## Installation and startup
 
-**`sapi: Docker is not running or you lack permission`**
-macOS: start OrbStack / Docker Desktop (sapi tries to do this for you).
-Linux: `sudo usermod -aG docker "$USER"`, then log out and back in. Check with `docker info`.
+**`sapi: command not found` after installing**
+Run `~/.local/bin/sapi`, or add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile. If you used `SAPI_INSTALL_DIR`, use that path instead.
 
-**`sapi: an interactive terminal is required`**
-sapi attaches a TUI; run it from a real terminal, not from a script or a pipe.
+**Docker is missing or the build rejects heredoc syntax**
+Use Docker 23+ with Buildx. On macOS, install [OrbStack](https://orbstack.dev) or Docker Desktop. On Debian, follow [Docker's installation guide](https://docs.docker.com/engine/install/debian/); the distribution's `docker.io` may be too old.
 
-**`sapi: command not found` after install**
-`~/.local/bin` is not on your `PATH`. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile, or run `~/.local/bin/sapi`.
+**Docker is not running, or permission is denied**
+Check `docker info`. Start your macOS Docker provider; sapi attempts to open OrbStack or Docker Desktop automatically. On Debian, ensure the daemon is running and your user has access. `sudo usermod -aG docker "$USER"` requires logging out/in and grants root-equivalent host access. Do not run sapi with sudo merely to bypass the error.
 
-**The image build fails on `# syntax=docker/dockerfile:1` or `COPY <<EOF`**
-Your Docker is too old for BuildKit heredocs. Upgrade Docker (≥ 23) or install `docker-buildx`.
+**An interactive terminal is required**
+`sapi` and `sapi shell` need a terminal. For scripts, pipes, or cron, use `sapi run TASK` or pipe a task to `sapi run -`.
 
-**Files created by the agent are owned by root (Linux)**
-You're on an old sapi or set `SAPI_UID=0`. Fix existing files once with `sudo chown -R "$USER:$USER" .`; new files will be yours.
+**Startup is slow, or npm/apt returns a download error**
+The first build downloads base images and packages; pi also attempts a startup update by default. A registry can advertise a version before its tarball is available. Check the failing URL/service before retrying; repeated clean builds do not fix a missing upstream artifact. `SAPI_AUTO_UPDATE=0` skips the startup update, not the initial build. Version pins and limits are in [configuration](configuration.md#versions-and-installation).
 
-**Permission denied writing to `/workspace` on macOS**
-Make sure the directory is inside Docker Desktop's "File sharing" list (OrbStack shares everything by default).
+**I need a clean image build**
+`SAPI_REBUILD=1 sapi build` pulls base images and rebuilds without cache. It does not clear credentials, session volumes, or old images.
 
-**I have two agents running and want the first one**
-`sapi ls` shows them. Attach to a specific one with `docker attach <name>`; `sapi shell <name>` gives you a bash inside it.
+## Agents and access
 
-**I want to start fresh in this directory**
-`sapi rm` removes this directory's containers and their session volumes. Credentials are kept.
+**I detached and want the same running agent**
+Use `sapi ls`, then `docker attach NAME` for the agent, not its `-egress` sidecar. Ctrl-P, Ctrl-Q detaches without stopping. Running `sapi` or `sapi NAME` while that name is running allocates another numbered slot.
 
-**I want to log in again / use another provider**
-Inside the agent, run `/login` (pi's own flow). Credentials live in the `sapi-config` volume and are shared by every project.
+**I want a shell, not the agent UI**
+`sapi shell NAME` opens Bash in `/pi-sessions`. It inherits a running agent's network; only temporary shells default to no network. A joining shell does not add `/pi-sessions-runs`. See [sessions and shells](recovery.md#sessions-and-shells).
 
-**Migrating from the original `run-pi` launcher**
-Your credentials are in the old `pi-coding-agent-config` volume. Copy them once:
+**I want a new conversation / a clean project agent**
+Pi's `/new` starts a conversation without deleting stored history. `sapi rm` instead stops/removes this workspace's managed containers and deletes their session volumes, including headless history; it keeps config volumes, workspace files, backups, and images. `sapi rm --all` applies across all managed projects.
+
+**I need another provider or separate credentials**
+Use `/login` in pi, or pass a provider's exported API-key variable with `SAPI_ENV`. Credentials/settings are shared through `sapi-config` by default. Use the same `SAPI_CONFIG_VOLUME=NAME` on subsequent starts and shells for a [separate trust domain](configuration.md#environment-only-controls).
+
+**`git push` or API calls need credentials**
+Pass exported variable names, for example `SAPI_ENV="GH_TOKEN ANTHROPIC_API_KEY" sapi`. This does not configure Git authentication, install `gh`, or forward your host SSH agent. Set up your chosen HTTPS credential helper inside the container; avoid embedding tokens in Git URLs or logs. SSH transport is unavailable in allowlist mode.
+
+**`git commit` needs an identity**
+Inside `sapi shell`, run `git config --global user.name "You"` and `git config --global user.email you@example.com`. The global Git config lives in the shared config volume.
+
+**Linux files were created with unexpected ownership**
+Check `SAPI_UID` / `SAPI_GID` and whether sapi was run as root. Defaults use the invoking Linux user's uid/gid. Repair only affected paths with the intended numeric uid/gid; do not blindly change ownership of a shared project.
+
+**macOS cannot write `/workspace`**
+Check the Docker provider's file-sharing permissions for this directory. Sapi uses uid 0 inside macOS containers; host ownership mapping belongs to the provider, not to that container uid.
+
+## Configuration, network, and recovery
+
+**A config value is rejected**
+`sapi config keys` lists supported keys; `sapi config path` prints the selected file. Values are not shell-quoted or expanded. Comments must occupy a whole line; elsewhere `#` is literal. Options such as `SAPI_MODEL` are environment-only. See [configuration](configuration.md).
+
+**A host is blocked, or the network log is empty**
+Presets may need extra provider/login/CDN hosts. Use `sapi netlog NAME` for the relevant sidecar. TLS/HTTP allow records appear when connections end; firewall-dropped packets do not get JSON records. Port 22 and other non-80/443 ports remain blocked. See [network limits](network.md#operational-limits).
+
+**The backup path is inside the workspace / space is insufficient**
+Choose `backup_dir` outside the workspace, with room for a complete archive. Backups include `.git`, build outputs, and secrets. `backup_keep` bounds archive count, not disk use. A failed backup prevents the selected agent start.
+
+**A backup is already running / its lock is incomplete**
+Retry first. A live creator may be publishing ownership or recovering a stale lock. Known-dead owners recover automatically. If the error persists, stop all backups for that project and inspect the printed `.backup.lock` / `.backup.reap` paths. Only after confirming no backup is running, remove the lock's `pid` if present and use `rmdir` for the empty lock/recovery directories. Never recursively delete their parent: it contains backups.
+
+**Restore reports `original preserved at …`**
+Stop other writers. Inspect the printed `old` path and intended destination, then move the original back when safe. Do not delete `.sapi-restore.*` until its contents are recovered. A multi-path restore is not one transaction; earlier successful paths remain restored.
+
+**Restoring a directory removed a new file**
+`restore --files DIR` replaces that directory exactly. Restore individual files for selective changes, or restore the whole backup beside the original and compare. See [restore](recovery.md#restore).
+
+## Legacy credentials and reporting
+
+The original `run-pi` launcher used `pi-coding-agent-config`. To keep using that volume, set `SAPI_CONFIG_VOLUME=pi-coding-agent-config`. To copy it into the default volume, stop agents using either volume first:
 
 ```sh
 docker volume create sapi-config
-docker run --rm -v pi-coding-agent-config:/from -v sapi-config:/to alpine cp -a /from/. /to/
+docker run --rm -v pi-coding-agent-config:/from:ro -v sapi-config:/to alpine cp -a /from/. /to/
 ```
 
-Or keep using the old volume: `export SAPI_CONFIG_VOLUME=pi-coding-agent-config`.
-
-**Rebuild everything**
-`SAPI_REBUILD=1 sapi` pulls fresh base images and rebuilds without cache.
-
-**`git commit` inside the agent fails with "Please tell me who you are"**
-Set your identity once; it is stored in the config volume and survives container rebuilds:
-`git config --global user.name "You" && git config --global user.email you@example.com`
-(run it from `sapi shell`, or ask the agent to).
-
-**`git push` / API calls need a token**
-Nothing from your host environment is passed in by default. Opt in per variable:
-`SAPI_ENV="GH_TOKEN ANTHROPIC_API_KEY" sapi`. Only pass what the task needs.
-
-**`sapi: backup: … is inside …`**
-You ran sapi in a directory that contains the backup folder (for example your home directory). Point `SAPI_BACKUP_DIR` or `backup_dir` somewhere outside it.
-
-**`sapi: backup: not enough space`**
-The destination has less free space than the directory is large. Free space, or set `backup_dir` to another volume. Backups are never skipped silently in safer mode.
-
-**`sapi: unknown setting` on start**
-A typo or invalid value in `~/.config/sapi/config`. `sapi config keys` lists every supported key and type; `sapi config path` prints the file. Comments must occupy a whole line; elsewhere `#` is literal.
-
-**Backups are slow or large**
-They include everything, by design. Keep build output and `node_modules` out of directories you run sapi in, or accept the cost. `backup_keep` bounds how many are kept.
-
-**`sapi: backup: another backup … is in progress`**
-Another sapi process is archiving the same directory; wait for it. A lock with a known-dead owner is recovered automatically. Never delete a lock whose pid is still running.
-
-**`sapi: backup: incomplete lock …` / `lock recovery busy or interrupted`**
-Retry first: another process may still be publishing its PID or recovering a stale lock. If the error persists, stop all backups for that project and inspect the printed `.backup.lock` / `.backup.reap` paths. Only after confirming no backup is running, remove the lock's `pid` file if present and remove the empty lock/recovery directories with `rmdir`. Do not recursively delete their parent: that is where the backups live.
-
-**`sapi: restore: rollback incomplete; original preserved at …`**
-The swap failed or was interrupted and the original could not safely be put back. Stop other writers, inspect the printed `old` path and the intended destination, then move the original back when safe. Do not remove `.sapi-restore.*` until its contents are recovered.
-
-**A directory restore removed a new file**
-`restore --files DIR` replaces the selected directory exactly as it was in the backup; additions beneath it are removed. Restore individual files when you need a merge, or whole-tree restore beside the original and compare first.
-
-**Where are the session files?**
-`sapi shell` puts you in `/pi-sessions` (interactive) with `/pi-sessions-runs` (headless runs) and `/pi-config` beside it. From the host, the Docker volumes are `sapi-<dir>-<hash>-sessions`, `…-runs-sessions` and `sapi-config`.
-
-**Still stuck**
-Run `sapi dockerfile`, `sapi config show`, and `docker info`; open an issue with the output and your OS (redact credentials and personal paths). Security findings go through [SECURITY.md](../SECURITY.md), not a public issue.
-
+For other failures, collect `sapi version`, `sapi config show`, `docker info`, your OS/provider, and the failing command. Review/redact outputs before reporting: workspace paths, custom Dockerfile contents, logs, and environment values may be sensitive. Security findings use the [private reporting process](../SECURITY.md), not public reproduction details.

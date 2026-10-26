@@ -1,0 +1,102 @@
+# Configuration
+
+`sapi config` shows effective config-file settings and where each value came from. `sapi config keys` lists the accepted keys. Model selection, version controls, and other environment-only options are listed separately below.
+
+## Config file
+
+Default: `~/.config/sapi/config`. `$XDG_CONFIG_HOME/sapi/config` or `SAPI_CONFIG_FILE` can change it; `sapi config path` prints the selected path.
+
+```sh
+sapi config set safer true
+sapi config set memory_mib 8192
+sapi config set packages "golang make"
+```
+
+The corresponding file contains unquoted values:
+
+```text
+# sapi settings
+safer = true
+memory_mib = 8192
+packages = golang make
+```
+
+Precedence: **flag > environment > config file > default**. Only `safer` has command-line flags (`--safer` / `--no-safer`, before the command). A set-but-empty environment variable overrides config: it clears `packages` or `allow`, but is invalid for scalar settings.
+
+**Current environment-validation limitation:** a malformed environment override can print an error yet let the command continue. An invalid `SAPI_SAFER` can override a saved `safer = true` without taking a backup. Use valid values or an explicit `--safer` flag; do not assume an invalid environment value prevents agent startup. This is an implementation issue, not intended safety behavior.
+
+The file is parsed, never executed. Use one `key = value` per line. Blank lines and whole-line `#` comments are allowed; elsewhere `#` is literal. Shell quoting, variable expansion, and `~` expansion are not performed in the file. Paths must be absolute. Unknown keys or invalid values cause an error. `sapi config set` validates the value and replaces the file atomically with mode 0600.
+
+## Persistent settings
+
+Defaults below assume no XDG or config-path override.
+
+| Config key | Environment override | Default / meaning |
+|---|---|---|
+| `safer` | `SAPI_SAFER` | `false`; backup before interactive/headless agent starts |
+| `backup_dir` | `SAPI_BACKUP_DIR` | `~/.local/share/sapi/backups`; must be outside the workspace |
+| `backup_keep` | `SAPI_BACKUP_KEEP` | `10` per workspace; `0` keeps all |
+| `cpus` | `SAPI_CPUS` | `0` = unlimited; accepts a non-negative decimal |
+| `memory_mib` | `SAPI_MEMORY_MIB` | `0` = unlimited; integer MiB |
+| `pids` | `SAPI_PIDS` | `4096`; `0` = unlimited |
+| `packages` | `SAPI_PACKAGES` | Empty; comma/space-separated Debian package names |
+| `dockerfile_extra` | `SAPI_DOCKERFILE_EXTRA` | `Dockerfile.extra` beside the selected config file; appended if present |
+| `network` | `SAPI_NETWORK` | `full`; or `allowlist` |
+| `allow` | `SAPI_ALLOW` | `@providers`; used only in allowlist mode |
+
+Booleans accept `true/false`, `yes/no`, `on/off`, or `1/0`, case-insensitively. Counts are non-negative integers. The backup root also honors `XDG_DATA_HOME`.
+
+- [Recovery](recovery.md): backups, timeouts, diff, and restore.
+- [Toolchains](toolchain.md): image packages and Dockerfile fragments.
+- [Network](network.md): allowlist syntax and presets.
+
+## Environment-only controls
+
+These are **not** accepted by `sapi config set`.
+
+| Variable | Default / meaning |
+|---|---|
+| `SAPI_MODEL` | Unset: pi selects the model. Otherwise passed to `pi --model`. |
+| `SAPI_PI_VERSION` | `latest`; pi version requested when building the image |
+| `SAPI_AUTO_UPDATE` | `1`; `0` disables pi's update attempt on agent start |
+| `SAPI_REBUILD` | `0`; `1` rebuilds with `--no-cache --pull` |
+| `SAPI_UID` / `SAPI_GID` | Host uid/gid on Linux; `0` on macOS, inside the container; see the [root-agent limitation](security.md#root-agents-and-allowlisting) |
+| `SAPI_CONFIG_VOLUME` | `sapi-config`; shared pi credentials/settings volume |
+| `SAPI_ENV` | Empty; whitespace-separated names of host variables to pass through |
+| `SAPI_DOCKER_ARGS` | Empty; extra Docker arguments, whitespace-split without quote interpretation or glob expansion |
+| `SAPI_IMAGE` | Override the agent image name/tag; pre-pull a custom image, otherwise sapi builds under that name |
+| `SAPI_EGRESS_IMAGE` | Override the digest-pinned sidecar image |
+| `SAPI_EGRESS_BUILD` | `1` builds the sidecar from checksum-pinned source instead of pulling it |
+
+`SAPI_ENV` passes names, not literal assignments: after exporting a provider key, use `SAPI_ENV=OPENROUTER_API_KEY sapi`. Containers using `SAPI_ENV` are recreated on start so secret values do not become stale; those values are not hashed into labels.
+
+For a separate credential/settings trust domain:
+
+```sh
+SAPI_CONFIG_VOLUME=sapi-config-review sapi
+```
+
+Use the same variable on later starts and shells to access that volume. This does not make an untrusted project safe by itself. The workspace, config volume, and session volumes remain writable by the agent.
+
+`SAPI_DOCKER_ARGS`, custom images, and Dockerfile fragments are trusted-user escape hatches that can defeat isolation. Never inherit them from an untrusted project or shell setup. See [security](security.md).
+
+## Versions and installation
+
+The installer defaults to the release tag specified in `install.sh`; it does not query GitHub for the latest release. `sapi upgrade` normally fetches the installer from `main`, which selects the release to install. The install directory defaults to `~/.local/bin` (`SAPI_INSTALL_DIR` overrides it); upgrades replace the running launcher's file in its existing directory.
+
+`SAPI_REF` selects a tag, commit, or branch for installation/upgrade. It is an invocation-time setting, not a saved preference. To install development code:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/sapiensmalti/sapi/main/install.sh | SAPI_REF=main bash
+SAPI_REF=main sapi upgrade             # keep following main on a later upgrade
+```
+
+An ordinary `sapi upgrade` returns to the installer's selected release. The launcher version string alone may not distinguish unreleased `main` changes from the last tag.
+
+Sapi upgrades do not directly update pi. Pinning `SAPI_PI_VERSION` pins the requested pi version, not its complete transitive dependency graph. Disable automatic pi updates as well when you want to retain the installed version:
+
+```sh
+SAPI_PI_VERSION=1.4.0 SAPI_AUTO_UPDATE=0 sapi
+```
+
+Image tags describe build inputs, not a lock of npm, apt, or base-image contents. See [supply-chain limits](security.md#threat-model) before treating a build as reproducible.
