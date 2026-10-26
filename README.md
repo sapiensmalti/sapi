@@ -35,8 +35,10 @@ AI coding agents run shell commands. Giving one your whole laptop is a bad trade
 
 ## Install
 
-**Requirements:** macOS or Ubuntu/Linux, Bash, `curl`, standard Unix tools, and Docker 23+
-([OrbStack](https://orbstack.dev) or Docker Desktop on macOS; `apt-get install docker.io` on Ubuntu).
+**Requirements:** macOS or Debian 12+ (other Linux distributions use the same launcher), Bash, `curl`, standard Unix tools, and Docker 23+ with Buildx.
+
+- **macOS:** [OrbStack](https://orbstack.dev) or Docker Desktop.
+- **Debian:** follow [Docker's Debian installation guide](https://docs.docker.com/engine/install/debian/) for a current Engine and Buildx plugin. The distribution's `docker.io` package may be too old. `docker info` must work as your normal user.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sapiensmalti/sapi/main/install.sh | bash
@@ -138,7 +140,7 @@ The launcher is one readable file and stays that way; anything long-running or s
 - `test/check.sh` — lint and unit checks, including `bash test/recovery.sh` for recovery failures and concurrency (no Docker; Linux + macOS)
 - `test/smoke.sh` — real image, container, restore, and firewall checks (Docker; Linux + macOS CI)
 
-Run both before opening a PR. Changes that add dependencies, touch the host outside `~/.local/bin`, or widen the container's access need a very good reason.
+Run both before opening a PR. CI checks the launcher and recovery in Debian 12/13 userspaces as well as on Linux and macOS runners; real Docker/firewall smoke tests run on Linux and macOS. The Debian jobs do not test a native Debian Docker host. Changes that add dependencies, touch the host outside `~/.local/bin`, or widen the container's access need a very good reason.
 
 ## Security and changes
 

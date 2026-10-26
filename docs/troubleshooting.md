@@ -1,7 +1,7 @@
 # Troubleshooting
 
 **`sapi: docker not found`**
-Install Docker. macOS: `brew install orbstack` (or Docker Desktop). Ubuntu: `sudo apt-get install -y docker.io`.
+Install Docker 23+ with Buildx. macOS: `brew install orbstack` (or Docker Desktop). Debian: follow [Docker's installation guide](https://docs.docker.com/engine/install/debian/); the distribution's `docker.io` package may be too old.
 
 **`sapi: Docker is not running or you lack permission`**
 macOS: start OrbStack / Docker Desktop (sapi tries to do this for you).

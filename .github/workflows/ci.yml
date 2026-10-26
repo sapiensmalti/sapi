@@ -16,13 +16,35 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: install shellcheck (Ubuntu)
+      - name: install shellcheck (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y shellcheck
       - name: install shellcheck (macOS)
         if: runner.os == 'macOS'
         run: brew install shellcheck
       - run: test/check.sh
+
+  debian:
+    name: Debian ${{ matrix.release }} (launcher and recovery)
+    # GitHub's hosted Linux runner labels name the host, not the test userspace.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [bookworm, trixie]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: check in Debian userspace (no Docker socket)
+        run: |
+          docker run --rm \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" \
+            --workdir /src "debian:${{ matrix.release }}-slim" bash -ec '
+              apt-get update
+              apt-get install -y --no-install-recommends bash ca-certificates curl shellcheck util-linux
+              bash test/check.sh
+            '
 
   egress:
     name: egress (fmt, clippy, tests, image)

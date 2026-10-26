@@ -9,6 +9,7 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 - Correct diff additions against empty backups, preserve trailing newlines in symlink targets, and return `2` for comparison errors (`1` remains changes only).
 - Preserve newline-containing parent components during selective restore; add deterministic recovery-failure and concurrency regression tests.
 - Clarify backup consistency limits, per-selection restore transactions, and interrupted-recovery instructions.
+- Add Debian 12/13 launcher/recovery CI alongside existing Linux/macOS coverage; use Debian-first installation guidance with a current Docker Engine and Buildx plugin.
 
 ## [0.6.1] - 2026-10-25
 
@@ -38,7 +39,7 @@ Security and correctness release; no new configuration is required.
 
 - Correct host-write, reproducibility, restore, and security-boundary documentation; document shared-config trust and dangerous escape hatches.
 - Add private security reporting, this changelog, dependency policy, and pinned GitHub Actions.
-- Run all no-Docker checks on Ubuntu and macOS, and real Docker/firewall smoke tests on both platforms.
+- Run all no-Docker checks on Linux and macOS, and real Docker/firewall smoke tests on both platforms.
 
 ## [0.6.0] - 2026-10-25
 
