@@ -21,7 +21,7 @@ sapi config set safer true           # subsequent agent starts, including run
 sapi --no-safer run "Explain this project."   # override the saved setting
 ```
 
-Use valid config/environment values: malformed environment overrides are a [known validation limitation](configuration.md#config-file). An explicit `--safer` flag takes precedence over `SAPI_SAFER`.
+Config and environment values are validated before any agent launch. An explicit `--safer` flag takes precedence over `SAPI_SAFER`; see [configuration](configuration.md#config-file).
 
 A backup contains the whole workspace: `.git`, hidden files, build output, secrets, and symlinks. It is a `tar.gz` with one top-level directory. Filesystem modes and timestamps are stored; this is not a filesystem snapshot or a record of every filesystem attribute.
 
@@ -69,7 +69,7 @@ sapi diff /path/to/backup.tar.gz --full
 
 Output lists `A`dded, `M`odified, and `D`eleted paths. Regular files are compared by content hash and mode; directories by mode; symlinks by target without following them. Other special files are identified by type. Timestamps, ownership, ACLs, and extended attributes are not compared. Control-character paths are escaped for display.
 
-`--full` adds unified hunks for regular files. No git repository is needed, and git-ignored files are included. Comparison exit status: **0 unchanged, 1 changes, 2 error**; caught signals retain their usual statuses. There is a current exception: early config-file validation errors also return `1`, so that status alone does not always prove there were differences.
+`--full` adds unified hunks for regular files. No git repository is needed, and git-ignored files are included. Comparison exit status: **0 unchanged, 1 changes, 2 error**; caught signals retain their usual statuses. Startup and config validation errors also use `2`, so `1` is reserved for a completed comparison with differences.
 
 Diff verifies an available checksum sidecar; a missing checksum produces a warning. It extracts the backup and hashes both trees, so large workspaces need time and temporary disk space. `$TMPDIR` must be outside the workspace. Restore or diff only archives you trust: a checksum detects corruption, not malicious authorship.
 

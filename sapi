@@ -39,7 +39,9 @@ ENV LANG=C.UTF-8 \
     TERM=xterm-256color \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
     NPM_CONFIG_FUND=false \
-    NPM_CONFIG_AUDIT=false
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_PREFIX=/opt/pi \
+    PATH=/opt/pi/bin:$PATH
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -55,28 +57,38 @@ RUN npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@${PI_
 # uv gives the agent Python without touching the host. Two static binaries.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-# Entrypoint: optional self-update, then drop to the host user (Linux) so files
-# written to /workspace are owned by you, not root. SAPI_CMD selects what
-# runs after the drop (default pi; `sapi shell` uses bash).
+# Only ownership repair runs privileged. All pi code, including updates and
+# global extensions, runs after the irreversible uid/capability drop.
 COPY <<'ENTRYPOINT_EOF' /usr/local/bin/sapi-entrypoint
 #!/bin/bash
 set -eu
 cmd="${SAPI_CMD:-pi}"
-if [ "$cmd" = "pi" ] && [ "${SAPI_AUTO_UPDATE:-1}" = "1" ]; then
-    pi update self --no-approve >&2 \
-        || printf 'sapi: pi update failed; using installed pi %s\n' "$(pi --version 2>/dev/null)" >&2
-fi
-uid="${SAPI_UID:-0}"
-gid="${SAPI_GID:-0}"
-if [ "$uid" != "0" ]; then
-    for dir in /pi-config /pi-sessions /pi-sessions-runs /home/sapi; do
-        [ -d "$dir" ] || continue
-        [ "$(stat -c '%u:%g' "$dir")" = "$uid:$gid" ] || chown -R "$uid:$gid" "$dir"
-    done
-    exec setpriv --reuid "$uid" --regid "$gid" --clear-groups \
-        env HOME=/home/sapi USER=sapi "$cmd" "$@"
-fi
-exec "$cmd" "$@"
+uid="${SAPI_UID:-1000}"
+gid="${SAPI_GID:-1000}"
+for value in "$uid" "$gid"; do
+    [[ "$value" =~ ^[0-9]+$ && ${#value} -le 10 ]] && (( 10#$value < 4294967295 )) \
+        || { printf 'sapi: invalid container uid/gid\n' >&2; exit 1; }
+done
+uid=$((10#$uid)); gid=$((10#$gid))
+(( uid != 0 )) || { printf 'sapi: refusing to run agent commands as root\n' >&2; exit 1; }
+dirs=(/pi-config /pi-sessions /pi-sessions-runs /home/sapi)
+# Only update-enabled agents need a writable npm prefix. No pi code runs as root.
+if [ "$cmd" = "pi" ] && [ "${SAPI_AUTO_UPDATE:-1}" = "1" ]; then dirs+=(/opt/pi); fi
+for dir in "${dirs[@]}"; do
+    [ -d "$dir" ] || continue
+    [ "$(stat -c '%u:%g' "$dir")" = "$uid:$gid" ] || chown -R "$uid:$gid" "$dir"
+done
+exec setpriv --reuid "$uid" --regid "$gid" --clear-groups \
+    --inh-caps=-all --ambient-caps=-all --no-new-privs \
+    env HOME=/home/sapi USER=sapi bash -c '
+        set -eu
+        cmd="$1"; shift
+        if [ "$cmd" = "pi" ] && [ "${SAPI_AUTO_UPDATE:-1}" = "1" ]; then
+            pi update self --no-approve >&2 \
+                || printf "sapi: pi update failed; using installed pi %s\n" "$(pi --version 2>/dev/null)" >&2
+        fi
+        exec "$cmd" "$@"
+    ' sapi "$cmd" "$@"
 ENTRYPOINT_EOF
 RUN chmod 0755 /usr/local/bin/sapi-entrypoint
 
@@ -89,6 +101,15 @@ readonly DOCKERFILE
 # Helpers
 # ---------------------------------------------------------------------------
 ERROR_STATUS=1
+# Establish diff's error contract before validating startup environment too.
+for command_arg in "$@"; do
+    case "$command_arg" in
+        --safer|--no-safer) continue ;;
+        diff) ERROR_STATUS=2; trap 'exit 2' ERR ;;
+    esac
+    break
+done
+unset command_arg
 die() { printf 'sapi: %s\n' "$*" >&2; exit "$ERROR_STATUS"; }
 log() { printf 'sapi: %s\n' "$*" >&2; }
 
@@ -165,7 +186,7 @@ Environment:
   SAPI_PI_VERSION     pi npm version to install in the image (default: latest)
   SAPI_AUTO_UPDATE=0  Do not run 'pi update' on container start
   SAPI_REBUILD=1      Rebuild the image from scratch
-  SAPI_UID / SAPI_GID Container user (default: your uid/gid on Linux, root on macOS)
+  SAPI_UID / SAPI_GID Container user (default: your uid/gid; agent commands refuse uid 0)
   SAPI_CONFIG_VOLUME  Docker volume for pi config and credentials (default: sapi-config)
   SAPI_ENV            Space-separated host variables to pass through, e.g. "ANTHROPIC_API_KEY GH_TOKEN"
   SAPI_DOCKER_ARGS    Extra arguments for 'docker create' (split on whitespace)
@@ -230,16 +251,21 @@ PI_VERSION="${SAPI_PI_VERSION:-latest}"
 MODEL="${SAPI_MODEL:-}"
 REBUILD="${SAPI_REBUILD:-0}"
 AUTO_UPDATE="${SAPI_AUTO_UPDATE:-1}"
-if [[ "$OS" == "Linux" ]]; then
-    UID_="${SAPI_UID:-$(id -u)}"; GID_="${SAPI_GID:-$(id -g)}"
-else
-    UID_="${SAPI_UID:-0}"; GID_="${SAPI_GID:-0}"
-fi
+normalize_identity() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ && ${#value} -le 10 ]] && (( 10#$value < 4294967295 )) \
+        || die "SAPI_UID and SAPI_GID must be valid numeric uid/gid values"
+    printf '%s' "$((10#$value))"
+}
+UID_="$(normalize_identity "${SAPI_UID:-$(id -u)}")"
+GID_="$(normalize_identity "${SAPI_GID:-$(id -g)}")"
 readonly OS WORKSPACE WORKSPACE_HASH PI_VERSION MODEL REBUILD AUTO_UPDATE UID_ GID_
 
 [[ "$REBUILD" == 0 || "$REBUILD" == 1 ]] || die "SAPI_REBUILD must be 0 or 1"
 [[ "$AUTO_UPDATE" == 0 || "$AUTO_UPDATE" == 1 ]] || die "SAPI_AUTO_UPDATE must be 0 or 1"
-[[ "$UID_$GID_" =~ ^[0-9]+$ ]] || die "SAPI_UID and SAPI_GID must be integers"
+require_agent_identity() {
+    [[ "$UID_" != 0 ]] || die "refusing to run an agent as root; use a non-root account or set SAPI_UID/SAPI_GID to a non-root identity with workspace access"
+}
 
 # The effective Dockerfile is the embedded one plus the user's toolchain
 # customisation (see `packages` and `dockerfile_extra`). The image tag is a
@@ -301,7 +327,7 @@ setting_help() {
   packages     list    extra Debian packages baked into the image, e.g. "golang make postgresql-client"
   dockerfile_extra path  Dockerfile fragment appended to the image when the file exists
                        (default: ~/.config/sapi/Dockerfile.extra; user-level only, never from a project)
-  network      enum    full (default) | allowlist — hostname filter on 80/443; root-agent limitations apply
+  network      enum    full (default) | allowlist — hostname filter on 80/443; non-root agents only
   allow        list    hosts for network = allowlist: host, *.suffix, host:port, or presets
                        @providers @github @npm @pypi @cargo @go @debian @huggingface  (default: @providers)
 HELP
@@ -385,9 +411,10 @@ validate_setting() {  # $1 key, $2 value, $3 where (for messages)
 # never sourced. Unknown keys or invalid values refuse to start: a safety
 # setting silently ignored because of a typo is worse than none.
 load_config() {
+    local line n=0 key value
+    for key in $SETTING_KEYS; do unset "CFG_$key"; done
     [[ -f "$CONFIG_FILE" ]] || return 0
     [[ -r "$CONFIG_FILE" ]] || die "cannot read $CONFIG_FILE"
-    local line n=0 key value
     while IFS= read -r line || [[ -n "$line" ]]; do
         n=$((n + 1))
         line="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
@@ -395,7 +422,7 @@ load_config() {
         [[ "$line" =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] \
             || die "$CONFIG_FILE:$n: expected 'key = value', got '$line'"
         key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
-        value="$(validate_setting "$key" "$value" "$CONFIG_FILE:$n: $key")" || exit 1
+        value="$(validate_setting "$key" "$value" "$CONFIG_FILE:$n: $key")" || exit "$ERROR_STATUS"
         printf -v "CFG_$key" '%s' "$value"
     done <"$CONFIG_FILE"
 }
@@ -500,7 +527,7 @@ egress_start() {  # $1 agent container name, $2 extra docker run flags (e.g. --r
     # shellcheck disable=SC2086
     docker run --detach $extra --name "$name" --init --read-only \
         --tmpfs "/run:rw,noexec,nosuid,nodev,size=1048576,mode=755" \
-        --label "$LABEL.managed=true" --label "$LABEL.egress-of=$agent" --label "$LABEL.workspace-hash=$WORKSPACE_HASH" \
+        --label "$LABEL.managed=true" --label "$LABEL.egress-of=$agent" --label "$LABEL.workspace=$WORKSPACE" --label "$LABEL.workspace-hash=$WORKSPACE_HASH" \
         --env "EGRESS_ALLOW=$(expand_allow "$SET_allow")" --env "EGRESS_UID=$EGRESS_UID" \
         --security-opt no-new-privileges --cap-drop ALL \
         --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \
@@ -535,25 +562,26 @@ cmd_netlog() {
 }
 resolve_settings() {
     load_config
-    local key spec env default cfg_var env_val
+    local key spec env default cfg_var value source where
     for key in $SETTING_KEYS; do
         spec="$(setting_spec "$key")"
         env="$(printf '%s' "$spec" | awk '{print $2}')"
         default="${spec#* * }"
         cfg_var="CFG_$key"
-        env_val="${!env-}"
         if [[ "$key" == safer && -n "$SAFER_FLAG" ]]; then
-            printf -v "SET_$key" '%s' "$SAFER_FLAG"; printf -v "SRC_$key" flag
+            value="$SAFER_FLAG"; source=flag; where=--safer
         elif declare -p "$env" >/dev/null 2>&1; then
-            # Set-but-empty is still an override. It is how a caller clears a
-            # configured package/allow list; for scalar types validation fails.
-            printf -v "SET_$key" '%s' "$(validate_setting "$key" "$env_val" "$env")" || exit 1
-            printf -v "SRC_$key" environment
-        elif [[ -n "${!cfg_var:-}" ]]; then
-            printf -v "SET_$key" '%s' "${!cfg_var}"; printf -v "SRC_$key" config
+            value="${!env}"; source=environment; where="$env"
+        elif declare -p "$cfg_var" >/dev/null 2>&1; then
+            value="${!cfg_var}"; source=config; where="$CONFIG_FILE: $key"
         else
-            printf -v "SET_$key" '%s' "$default"; printf -v "SRC_$key" default
+            value="$default"; source=default; where="$key (default)"
         fi
+        # Validate in an assignment, never inside printf's arguments: printf
+        # would hide a command substitution's failure and silently clear safety.
+        value="$(validate_setting "$key" "$value" "$where")" || exit "$ERROR_STATUS"
+        printf -v "SET_$key" '%s' "$value"
+        printf -v "SRC_$key" '%s' "$source"
     done
     SAFER="$SET_safer"; BACKUP_DIR="$SET_backup_dir"; BACKUP_KEEP="$SET_backup_keep"
 }
@@ -574,7 +602,7 @@ cmd_config() {
         set)
             [[ $# -eq 3 ]] || die "usage: sapi config set KEY VALUE"
             local key="$2" value
-            value="$(validate_setting "$key" "$3")" || exit 1
+            value="$(validate_setting "$key" "$3")" || exit "$ERROR_STATUS"
             load_config  # refuse to edit a file we cannot parse
             local dir tmp; dir="$(dirname "$CONFIG_FILE")"
             (umask 077 && mkdir -p "$dir") || die "cannot create $dir"
@@ -940,6 +968,7 @@ shell_banner() {
 }
 
 cmd_shell() {
+    require_agent_identity
     require_docker
     local name="" net=0 arg
     for arg in "$@"; do
@@ -1101,6 +1130,7 @@ prepare_network() {
 }
 
 cmd_start() {
+    require_agent_identity
     [[ -t 0 && -t 1 ]] || die "an interactive terminal is required"
     resolve_settings
     prepare_network
@@ -1195,6 +1225,7 @@ cmd_start() {
 # it answered, how it exited, and (via `sapi diff`) exactly what it changed.
 # ---------------------------------------------------------------------------
 cmd_run() {
+    require_agent_identity
     local json=0 timeout=0 task_parts=()
     while [[ $# -gt 0 ]]; do
         case "$1" in

@@ -7,7 +7,7 @@
 | `install.sh` | Download, syntax-check, and atomically install the launcher. No Docker installation or privilege escalation. |
 | `sapi` | Single-file Bash launcher with the agent Dockerfile and entrypoint embedded. |
 | Agent image | Debian bookworm / Node 24, pi from npm, git, ripgrep, jq, curl, SSH client, and `uv`/`uvx`. Python can be provisioned by uv; it is not preinstalled by sapi. |
-| Entrypoint | Attempt pi update, repair volume ownership as needed, then run pi or Bash with the configured uid/gid. |
+| Entrypoint | Repair volume ownership, drop uid/capabilities, then attempt pi update and run pi or Bash. |
 | `egress/` | Optional Rust sidecar for namespace firewall, local DNS responses, and hostname-filtered relays. |
 
 Only the launcher and its Dockerfiles are embedded in one file. The sidecar is a separate image/binary with its own source and tests. Bash orchestrates Docker; Rust handles the long-running network service. No component needs a Docker socket inside the agent container.
@@ -46,9 +46,9 @@ Sapi starts pi with `--continue`. This continues the slot's most recent stored s
 
 ## Entrypoint and other commands
 
-When the command is pi and effective auto-update is enabled, the entrypoint runs `pi update self --no-approve`; failure is logged and startup continues. In allowlist mode the launcher skips this unless `@npm` is present. Bash shells skip the update.
+The privileged bootstrap repairs ownership of config/session/home directories, then `setpriv` switches to a non-root uid/gid, clears supplementary groups and inheritable/ambient capabilities, and sets no-new-privileges. Both Linux and macOS default to the host uid/gid. UID 0 is refused, including at the image entrypoint.
 
-For nonzero uid, ownership is repaired on config/session/home directories if needed, then `setpriv` switches uid/gid and clears supplementary groups. Linux defaults to the host uid/gid; macOS defaults to uid 0 inside the container. Capabilities and exceptions are documented in [security](security.md).
+Pi is installed under `/opt/pi`. Update-enabled agents also receive ownership of that npm prefix; trusted bootstrap files remain root-owned. Only after privilege dropping does the entrypoint run `pi update self --no-approve`, with failure logged and startup continued. The launcher skips it in allowlist mode without `@npm`; Bash shells skip it. No pi code or extensions execute during privileged setup. See [security](security.md).
 
 `container_args` produces the shared Bash array of mounts, environment, labels, and hardening flags used by interactive agents, headless tasks, and temporary shells. Config parsing accepts only known keys and does not execute shell code; see [configuration](configuration.md).
 

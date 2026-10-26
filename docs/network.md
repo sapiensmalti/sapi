@@ -2,7 +2,7 @@
 
 Network access is **unrestricted by default**. Opt-in allowlist mode restricts the agent's external connections to allowed hostnames over HTTP on port 80 and TLS on port 443. It does not inspect encrypted content or make an allowed service trustworthy.
 
-**Root-agent limitation:** the current uid-0 setup, including the macOS default, retains identity-changing capabilities. Do not rely on this allowlist against hostile code in that configuration. See [root agents and allowlisting](security.md#root-agents-and-allowlisting).
+Agents must be non-root and unable to adopt the proxy uid. The launcher rejects root/proxy identities, and the entrypoint drops capabilities before pi or its updater runs. See [agent identity](security.md#agent-identity).
 
 ```sh
 sapi config set allow "@providers @github @npm"

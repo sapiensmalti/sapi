@@ -80,7 +80,7 @@ sapi config set allow "@providers @github @npm"
 Config-file settings use flag > environment > config > default precedence. Other controls, such as `SAPI_MODEL`, `SAPI_PI_VERSION`, and `SAPI_ENV`, are environment-only. See the [configuration reference](docs/configuration.md).
 
 - [Toolchains](docs/toolchain.md): extra Debian packages and user Dockerfile fragments.
-- [Network allowlist](docs/network.md): hostname filtering on ports 80/443; off by default. Read the [root-agent limitation](docs/security.md#root-agents-and-allowlisting) before relying on it.
+- [Network allowlist](docs/network.md): hostname filtering on ports 80/443; off by default. Requires a [non-root agent identity](docs/security.md#agent-identity).
 - `sapi dockerfile`: print the effective Dockerfile, including customizations.
 - `sapi build`: build or reuse the image without starting an agent.
 - `sapi help`: command reference.
@@ -95,7 +95,7 @@ To uninstall, remove `~/.local/bin/sapi` (or your chosen install path). Before d
 
 The Bash launcher embeds the agent Dockerfile and entrypoint; `egress/` contains the optional Rust sidecar. See [architecture](docs/architecture.md).
 
-- `test/check.sh`: lint and launcher tests, including `bash test/recovery.sh` for failure paths and concurrency. No Docker required.
+- `test/check.sh`: lint and launcher tests, including `bash test/recovery.sh` and `bash test/safety.sh` for failure paths, concurrency, and validation. No Docker required.
 - `test/smoke.sh`: real Docker builds, ownership, recovery, and firewall checks.
 - `egress/`: formatting, strict clippy, tests, and cargo-deny; commands are in [CI](.github/workflows/ci.yml).
 

@@ -2,6 +2,8 @@
 # Portable Linux/macOS lint and unit checks. No Docker required.
 # The linter is optional locally and mandatory in CI.
 set -Eeuo pipefail
+# Docker-backed behavior is shimmed here; never depend on a root CI user's uid.
+export SAPI_UID=1234 SAPI_GID=1234
 [[ "${DEBUG:-0}" == 1 ]] && set -x
 cd "$(dirname "$0")/.."
 
@@ -341,6 +343,13 @@ if bash test/recovery.sh; then
     ok "recovery regression suite (no Docker)"
 else
     bad "recovery regression suite (no Docker)"
+fi
+
+echo "fail-closed safety"
+if bash test/safety.sh; then
+    ok "safety regression suite (no Docker)"
+else
+    bad "safety regression suite (no Docker)"
 fi
 
 echo "hygiene"

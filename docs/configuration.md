@@ -23,7 +23,7 @@ packages = golang make
 
 Precedence: **flag > environment > config file > default**. Only `safer` has command-line flags (`--safer` / `--no-safer`, before the command). A set-but-empty environment variable overrides config: it clears `packages` or `allow`, but is invalid for scalar settings.
 
-**Current environment-validation limitation:** a malformed environment override can print an error yet let the command continue. An invalid `SAPI_SAFER` can override a saved `safer = true` without taking a backup. Use valid values or an explicit `--safer` flag; do not assume an invalid environment value prevents agent startup. This is an implementation issue, not intended safety behavior.
+Every effective value is validated before an image build, volume creation, or agent launch. Invalid environment overrides abort rather than clearing a safety setting. Empty `packages` and `allow` lists are honored in both the config file and environment.
 
 The file is parsed, never executed. Use one `key = value` per line. Blank lines and whole-line `#` comments are allowed; elsewhere `#` is literal. Shell quoting, variable expansion, and `~` expansion are not performed in the file. Paths must be absolute. Unknown keys or invalid values cause an error. `sapi config set` validates the value and replaces the file atomically with mode 0600.
 
@@ -60,13 +60,15 @@ These are **not** accepted by `sapi config set`.
 | `SAPI_PI_VERSION` | `latest`; pi version requested when building the image |
 | `SAPI_AUTO_UPDATE` | `1`; `0` disables pi's update attempt on agent start |
 | `SAPI_REBUILD` | `0`; `1` rebuilds with `--no-cache --pull` |
-| `SAPI_UID` / `SAPI_GID` | Host uid/gid on Linux; `0` on macOS, inside the container; see the [root-agent limitation](security.md#root-agents-and-allowlisting) |
+| `SAPI_UID` / `SAPI_GID` | Host uid/gid on Linux and macOS; agent commands refuse uid `0`; see [agent identity](security.md#agent-identity) |
 | `SAPI_CONFIG_VOLUME` | `sapi-config`; shared pi credentials/settings volume |
 | `SAPI_ENV` | Empty; whitespace-separated names of host variables to pass through |
 | `SAPI_DOCKER_ARGS` | Empty; extra Docker arguments, whitespace-split without quote interpretation or glob expansion |
 | `SAPI_IMAGE` | Override the agent image name/tag; pre-pull a custom image, otherwise sapi builds under that name |
 | `SAPI_EGRESS_IMAGE` | Override the digest-pinned sidecar image |
 | `SAPI_EGRESS_BUILD` | `1` builds the sidecar from checksum-pinned source instead of pulling it |
+
+UID/GID values are numeric and normalized before use. The agent uid must be nonzero, and in allowlist mode cannot equal the proxy uid (65532). Sapi never changes host workspace ownership to make an identity fit; choose a user with access to the shared directory. Invoking an agent command as host root requires an explicit non-root `SAPI_UID` and appropriate `SAPI_GID`.
 
 `SAPI_ENV` passes names, not literal assignments: after exporting a provider key, use `SAPI_ENV=OPENROUTER_API_KEY sapi`. Containers using `SAPI_ENV` are recreated on start so secret values do not become stale; those values are not hashed into labels.
 

@@ -4,6 +4,10 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ## Unreleased
 
+- Fail closed on invalid environment overrides; preserve intentionally empty config lists and return `2` for all diff validation failures.
+- Refuse root agent identities on every platform and normalize numeric uid/gid values before policy checks. Run pi, startup updates, and shells only after dropping privileges/capabilities; use `/opt/pi` for unprivileged npm updates.
+- Test the production launcher/entrypoint privilege profile, workspace writing, updates, and allowlist identity separation on Linux and macOS, not just stricter bare firewall probes.
+
 - Preserve saved originals if selective-restore rollback fails, the destination reappears, or a signal leaves the swap's commit uncertain; print the recovery path.
 - Refuse incomplete backup locks and serialize stale-owner recovery with an ownership recheck; never reclaim a lock merely because its PID has not been written yet.
 - Correct diff additions against empty backups, preserve trailing newlines in symlink targets, and return `2` for comparison errors (`1` remains changes only).

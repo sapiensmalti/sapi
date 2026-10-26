@@ -19,23 +19,19 @@ Running sapi in your home directory intentionally grants your home directory. Ru
 
 The shared container specification uses:
 
-- `--cap-drop ALL` plus only `CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER SETUID SETGID`, needed to repair volume ownership and drop privileges. `SETPCAP` is not granted. On Linux the real-container test verifies **zero effective and permitted capabilities** after the drop.
+- `--cap-drop ALL` plus only `CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER SETUID SETGID`, used only for ownership repair and privilege dropping. `SETPCAP` is not granted. The production entrypoint drops to a non-root uid, clears supplementary groups and inheritable/ambient capabilities, and sets `no-new-privileges` before running any pi code, including self-update. Kernel smoke probes check zero capabilities and failed root/proxy-uid adoption through the real launcher on both Linux and macOS.
 - `--security-opt no-new-privileges`, so setuid/file-capability execution cannot add privileges.
 - `--init`; optional CPU, memory, and pid ceilings.
 - No host network/PID namespace, no privileged mode, and no socket mounts **unless the user deliberately overrides the specification** (below).
 - In allowlist mode, a read-only sidecar owns a separate network namespace and the agent receives no network capabilities. See [network.md](network.md).
 
-On Linux the agent runs as your uid/gid. On macOS it runs as uid 0 **inside the container**, because Docker Desktop/OrbStack map bind-mount ownership; those remaining container capabilities do not grant host root. The macOS root user still has the listed capabilities inside the container, unlike the dropped Linux process.
+### Agent identity
 
-### Root agents and allowlisting
+Both Linux and macOS default to the invoking user's numeric uid/gid. Agent and shell commands refuse uid 0; an explicitly selected identity must have workspace access. Host root can build images or manage backups, but must select a non-root identity to launch an agent. Sapi does not change workspace ownership automatically.
 
-UID-0 agents retain identity-changing capabilities, including `SETUID` and `SETGID`. This includes the macOS default and Linux invocations as root. The sidecar exempts its own uid for upstream traffic; an agent able to adopt that uid can enter the exemption. **Do not treat allowlist mode as a reliable boundary against hostile code in this configuration.** `no-new-privileges` does not prevent that identity change.
+The proxy's uid is exempt from its firewall, so an agent must not be able to adopt it. Rejecting an initial uid collision alone is insufficient: the production entrypoint also drops identity-changing capabilities before running pi or its updater. Successful identity changes must remain impossible after exec, not just at initial startup.
 
-Capability-free non-root agents are the intended isolation case. Changing `SAPI_UID` / `SAPI_GID` requires checking workspace/volume permissions with your Docker provider; it is not a universally verified macOS workaround. Existing firewall smoke probes use `--cap-drop ALL`, so their success alone does not validate the root-agent capability set.
-
-### Invalid environment overrides
-
-Malformed environment settings are not reliably fail-closed: validation can print an error while the launcher continues with an empty effective value. In particular, an invalid `SAPI_SAFER` can bypass a saved `safer = true`. An explicit valid `--safer` flag takes precedence. See [configuration](configuration.md#config-file); a successful command exit alone is not proof that every environment override validated.
+Invalid configuration and environment values abort before launching Docker resources. This includes malformed safety booleans and zero-padded root/proxy identities. See [configuration](configuration.md#config-file).
 
 ## Explicit escape hatches
 
@@ -49,7 +45,7 @@ Sapi does not automatically read project-local launcher configuration. Explicitl
 - Optional `~/.config/sapi/config` and user toolchain fragments.
 - Optional backups and run manifests under `~/.local/share/sapi/backups` (mode 0600 in 0700 project folders).
 - Docker images, containers, and volumes; private temporary directories for backup/diff/restore.
-- No sudo, shell-profile edits, launch agents, background daemons, or launcher telemetry. pi and the model provider have their own network behavior and data policies.
+- No sudo, automatic workspace ownership changes, shell-profile edits, launch agents, background daemons, or launcher telemetry. pi and the model provider have their own network behavior and data policies.
 
 `sapi rm` removes managed containers and session volumes, including headless-run volumes. It deliberately keeps the config volume. Very old unlabeled volumes with no owning container may require manual removal.
 

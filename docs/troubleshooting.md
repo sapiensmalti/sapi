@@ -44,7 +44,7 @@ Inside `sapi shell`, run `git config --global user.name "You"` and `git config -
 Check `SAPI_UID` / `SAPI_GID` and whether sapi was run as root. Defaults use the invoking Linux user's uid/gid. Repair only affected paths with the intended numeric uid/gid; do not blindly change ownership of a shared project.
 
 **macOS cannot write `/workspace`**
-Check the Docker provider's file-sharing permissions for this directory. Sapi uses uid 0 inside macOS containers; host ownership mapping belongs to the provider, not to that container uid.
+Check the Docker provider's file-sharing permissions for this directory. Sapi now uses your host uid/gid inside macOS containers and refuses uid 0. Check file sharing and the selected identity rather than restoring root execution. Host ownership mapping also depends on the provider.
 
 ## Configuration, network, and recovery
 
