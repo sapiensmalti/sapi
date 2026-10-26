@@ -337,7 +337,11 @@ rm -rf "$rshim"
 rm -rf "$HOME" "$shim"; HOME="$REAL_HOME"; unset SAPI_CONFIG_FILE
 
 echo "recovery failure paths"
-check "recovery regression suite (no Docker)" bash test/recovery.sh
+if bash test/recovery.sh; then
+    ok "recovery regression suite (no Docker)"
+else
+    bad "recovery regression suite (no Docker)"
+fi
 
 echo "hygiene"
 check "LICENSE present"              test -f LICENSE
