@@ -4,12 +4,19 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ## Unreleased
 
+- Fail closed on invalid environment overrides; preserve intentionally empty config lists and return `2` for all diff validation failures.
+- Enforce container root (`0:0`) for every managed agent, pi updater, and shell on all platforms. Reject non-root identity requests, override conflicting Docker user/entrypoint flags, and verify real root credentials at the entrypoint. Linux workspace files may consequently be root-owned.
+- Replace proxy-UID firewall exemptions with exact cgroup-v2 membership; require compatible readiness and fail closed on legacy images/unsupported kernels. Pin sapi-egress 0.1.3 by verified image digest and source checksum; gate each architecture's publication on exact-image kernel smoke tests.
+- Add production-profile probes for root updates, workspace writes, conflicting user flags, cgroup isolation, and network enforcement after deliberate child-UID changes.
+- Publish readiness atomically; use server-assigned ephemeral ports in Rust integration tests instead of close-and-rebind port probes, and clean up child processes/readiness files on test failure.
+
 - Preserve saved originals if selective-restore rollback fails, the destination reappears, or a signal leaves the swap's commit uncertain; print the recovery path.
 - Refuse incomplete backup locks and serialize stale-owner recovery with an ownership recheck; never reclaim a lock merely because its PID has not been written yet.
 - Correct diff additions against empty backups, preserve trailing newlines in symlink targets, and return `2` for comparison errors (`1` remains changes only).
 - Preserve newline-containing parent components during selective restore; add deterministic recovery-failure and concurrency regression tests.
 - Clarify backup consistency limits, per-selection restore transactions, and interrupted-recovery instructions.
 - Add Debian 12/13 launcher/recovery CI alongside existing Linux/macOS coverage; use Debian-first installation guidance with a current Docker Engine and Buildx plugin.
+- Simplify the README and guides, add a configuration reference, and align help text with attachment, shell-network, cleanup, timeout, and logging behavior.
 
 ## [0.6.1] - 2026-10-25
 

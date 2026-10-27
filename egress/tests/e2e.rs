@@ -20,14 +20,6 @@ static INSTANCE: AtomicUsize = AtomicUsize::new(0);
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// Echo server: whatever arrives is written straight back.
 fn echo_server() -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -48,9 +40,20 @@ fn echo_server() -> SocketAddr {
     addr
 }
 
+#[derive(serde::Deserialize)]
+struct TestReady {
+    policy: String,
+    dns: u16,
+    dns_tcp: u16,
+    tls: u16,
+    http: u16,
+}
+
 struct Proxy {
     child: Child,
+    ready: std::path::PathBuf,
     dns: u16,
+    dns_tcp: u16,
     tls: u16,
     http: u16,
     log_rx: mpsc::Receiver<String>,
@@ -58,7 +61,6 @@ struct Proxy {
 
 impl Proxy {
     fn start(allow: &str, upstream: SocketAddr) -> Self {
-        let (dns, tls, http) = (free_port(), free_port(), free_port());
         let n = INSTANCE.fetch_add(1, Ordering::SeqCst);
         let ready = std::env::temp_dir().join(format!("egress-ready-{}-{n}", std::process::id()));
         let _ = std::fs::remove_file(&ready);
@@ -70,11 +72,11 @@ impl Proxy {
                 "--bind",
                 "127.0.0.1",
                 "--dns-port",
-                &dns.to_string(),
+                "0",
                 "--tls-port",
-                &tls.to_string(),
+                "0",
                 "--http-port",
-                &http.to_string(),
+                "0",
                 "--ready-file",
                 ready.to_str().unwrap(),
                 "--test-upstream",
@@ -91,18 +93,33 @@ impl Proxy {
                 let _ = tx.send(line);
             }
         });
+        // Own the child before waiting: failed startup must also be reaped.
+        let mut proxy = Self {
+            child,
+            ready,
+            dns: 0,
+            dns_tcp: 0,
+            tls: 0,
+            http: 0,
+            log_rx,
+        };
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !ready.exists() {
+        while !proxy.ready.exists() {
+            assert!(
+                proxy.child.try_wait().unwrap().is_none(),
+                "proxy exited before readiness"
+            );
             assert!(Instant::now() < deadline, "proxy did not become ready");
             thread::sleep(Duration::from_millis(20));
         }
-        Self {
-            child,
-            dns,
-            tls,
-            http,
-            log_rx,
-        }
+        let actual: TestReady =
+            serde_json::from_slice(&std::fs::read(&proxy.ready).unwrap()).unwrap();
+        assert_eq!(actual.policy, "test-no-firewall");
+        proxy.dns = actual.dns;
+        proxy.dns_tcp = actual.dns_tcp;
+        proxy.tls = actual.tls;
+        proxy.http = actual.http;
+        proxy
     }
 
     fn next_log(&self) -> serde_json::Value {
@@ -118,6 +135,7 @@ impl Drop for Proxy {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.ready);
     }
 }
 
@@ -209,6 +227,20 @@ fn dns_allowed_gets_sink_denied_gets_nxdomain() {
     assert_eq!(l["ev"], "deny");
     assert_eq!(l["host"], "evil.example");
     assert_eq!(l["proto"], "dns");
+
+    // TCP DNS uses its independently bound ephemeral port in test mode.
+    let mut tcp = TcpStream::connect(("127.0.0.1", p.dns_tcp)).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let query = dns_query("good.example");
+    tcp.write_all(&u16::try_from(query.len()).unwrap().to_be_bytes())
+        .unwrap();
+    tcp.write_all(&query).unwrap();
+    let mut len = [0; 2];
+    tcp.read_exact(&mut len).unwrap();
+    let mut response = vec![0; usize::from(u16::from_be_bytes(len))];
+    tcp.read_exact(&mut response).unwrap();
+    assert!(response.ends_with(&[198, 18, 0, 1]));
+    assert_eq!(p.next_log()["ev"], "allow");
 }
 
 #[test]

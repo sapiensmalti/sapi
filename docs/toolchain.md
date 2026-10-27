@@ -1,6 +1,6 @@
 # Toolchain customization
 
-The image ships what an agent needs most of the time: Debian, Node, `pi`, git, ripgrep, jq, curl, ssh, and `uv` for Python. Real projects need more — Go, Rust, `make`, `gcc`, a database client. Two user-level knobs add them without forking sapi.
+The default image contains Debian, Node, pi, git, ripgrep, jq, curl, an SSH client, and `uv`/`uvx`. Python can be provisioned by uv; sapi does not preinstall it. Add other tools through Debian packages or a trusted user Dockerfile fragment.
 
 ## Packages
 
@@ -18,30 +18,28 @@ For anything apt cannot express — a toolchain installer, a global npm package,
 
 ```dockerfile
 # ~/.config/sapi/Dockerfile.extra
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
-    && mv /root/.cargo/bin/* /usr/local/bin/
-RUN npm install -g typescript
-ENV GOFLAGS=-mod=vendor
+RUN npm install --global --ignore-scripts typescript
+ENV PAGER=less
 ```
 
 If the file exists it is appended verbatim after the packages layer. Another path: `sapi config set dockerfile_extra /path` or `SAPI_DOCKERFILE_EXTRA`.
 
-Two rules for fragments: **do not set `USER`** — the entrypoint starts as root and drops to your uid itself; and install tools system-wide (`/usr/local`), not into `/root`, because on Linux the agent runs as you, not root.
+The agent is always launched as root. Sapi appends `USER 0:0` after fragments and enforces it again at runtime; a fragment cannot select a different agent user. Tools under `/root` are available to the root agent, but container-local installations disappear when the container is replaced. For persistent tool availability, bake the full installation into the image. Fragments can execute arbitrary build steps; review them before use.
 
 ## How caching works
 
-The image tag is `sapi:<sha256(pi version + effective Dockerfile)>`. Changing `packages` or the fragment changes the tag, so the next start builds a new image and an unchanged definition is never rebuilt. `SAPI_REBUILD=1` forces `--no-cache --pull` (fresh base image and package versions). Old images stay until you remove them (`docker image prune`).
+The image tag uses the first 12 hex digits of SHA-256 over the requested pi version string and effective Dockerfile. Changing packages or the fragment changes the tag; an existing tag is reused, a missing image is built. `SAPI_REBUILD=1` forces `--no-cache --pull`. Mutable base/package sources mean this is caching, not a complete dependency lock. Old tagged images remain until explicitly removed with `docker image rm IMAGE`; ordinary `docker image prune` removes dangling images, not all old tagged sapi images.
 
 `sapi dockerfile` always prints the complete effective Dockerfile. There is nothing hidden between what you read and what gets built.
 
 ## Why only user-level
 
-Both knobs live in *your* config (`~/.config/sapi/`), never in the project. A `Dockerfile.extra` in a repository you cloned would be code execution on your Docker host at build time, chosen by whoever wrote the repo. sapi ignores project files for this purpose by design; if a project needs a toolchain, you decide to add it, once, and it applies to every directory you run sapi in.
+Sapi reads the user's selected config/fragment, not an automatic project Dockerfile. Settings apply across workspaces unless overridden for an invocation. A repository cannot silently select build steps, but explicitly pointing `SAPI_CONFIG_FILE` or `SAPI_DOCKERFILE_EXTRA` at an untrusted project file still grants that trust. See [configuration](configuration.md).
 
-If you work on projects with very different needs, keep fragments per project in your config dir and switch with `SAPI_DOCKERFILE_EXTRA=~/.config/sapi/go.df sapi`.
+If you work on projects with very different needs, keep fragments per project in your config dir and switch with `SAPI_DOCKERFILE_EXTRA="$HOME/.config/sapi/go.df" sapi`.
 
 ## Troubleshooting
 
 - **Build fails on a package name** — `apt-cache search NAME` in a Debian bookworm container, or check [packages.debian.org](https://packages.debian.org/bookworm/). sapi validates the *shape* of names, not their existence.
-- **Tool installed but "not found" inside the agent** — it was installed into `/root`; on Linux the agent runs as your uid with `HOME=/home/sapi`. Install to `/usr/local/bin` or set `PATH` with `ENV`.
+- **Tool installed but "not found" inside the agent** — check `PATH` and whether the tool was installed only in a previous container's writable layer. Root uses `HOME=/root`; bake persistent tools into the image.
 - **Image rebuilt unexpectedly** — something in the effective Dockerfile changed (`sapi dockerfile`), or `SAPI_PI_VERSION` did.

