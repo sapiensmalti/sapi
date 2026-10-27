@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml/badge.svg)](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml)
 
-[pi](https://github.com/earendil-works/pi) in Docker, scoped to the directory you run it from.
+Simple accessible [pi](https://github.com/earendil-works/pi) in Docker, scoped to the directory you run it from.
 
 **Version note:** this page describes `main`. Root-only execution, cgroup-based allowlisting, and published agent images are not in the installer's selected sapi release (`v0.6.1`); use the explicit development install below to get these changes.
 
