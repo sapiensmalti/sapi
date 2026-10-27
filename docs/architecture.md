@@ -6,7 +6,7 @@
 |---|---|
 | `install.sh` | Download, syntax-check, and atomically install the launcher. No Docker installation or privilege escalation. |
 | `sapi` | Single-file Bash launcher with the agent Dockerfile and entrypoint embedded. |
-| Agent image | Debian bookworm / Node 24, pi from npm, git, ripgrep, jq, curl, SSH client, and `uv`/`uvx`. Python can be provisioned by uv; it is not preinstalled by sapi. |
+| Agent image | Digest-pinned amd64/arm64 starting image: Debian bookworm / Node 24, reviewed pi, git, ripgrep, jq, curl, SSH client, and `uv`/`uvx`. Full-source builds remain available. Python is provisioned by uv, not preinstalled. |
 | Entrypoint | Verify actual root identity, set a root environment, optionally update pi, then exec pi or Bash without dropping identity. |
 | `egress/` | Optional Rust sidecar for namespace firewall, local DNS responses, and hostname-filtered relays. |
 
@@ -14,15 +14,17 @@ Only the launcher and its Dockerfiles are embedded in one file. The sidecar is a
 
 ## Build identity
 
-The agent image tag is `sapi:<first 12 hex digits of SHA-256(pi version string + effective Dockerfile)>`. The effective Dockerfile includes configured packages and the user's fragment. Build context is an empty temporary directory, not the workspace.
+The default image is selected by a published digest and checked against the embedded full-recipe fingerprint, starting pi-version label, and declared `0:0` user. Metadata/pull failures stop preparation; there is no silent source fallback.
 
-A missing image is built; an existing tag is reused. `SAPI_REBUILD=1` forces `--no-cache --pull`. A launcher upgrade does not necessarily change the image tag. Mutable upstream inputs can produce different bytes from the same build definition; this hash is not a reproducibility guarantee. See [security](security.md#threat-model).
+Packages/fragments normally extend that image. `SAPI_BUILD=1`, a different requested pi version, or `SAPI_REBUILD=1` selects the full embedded source recipe. Custom/source tags use the first 12 hex digits of SHA-256 over the requested pi version and effective recipe; missing images are built, cached images reused. An explicit cached `SAPI_IMAGE` is used as supplied. Build context is empty/private and cleaned on failure, never the workspace.
+
+These are image identities/cache keys, not a complete dependency lock. Pi startup updates remain enabled by default. Source/derived builds also depend on mutable inputs. See [images and builds](images.md).
 
 ## Interactive lifecycle
 
 Default base name: `sapi-<sanitized directory name>-<first 8 hex digits of path hash>`. An explicit `sapi NAME` supplies another base. Sapi scans that name, then `NAME-2`, `NAME-3`, and so on:
 
-1. Build/reuse the image. In safer mode, back up before starting the selected agent; other running agents are not stopped.
+1. Pull/build/reuse the image. In safer mode, back up before starting the selected agent; other running agents are not stopped.
 2. Skip a name owned by another workspace or a running container.
 3. Resume a stopped container only if its image ID, sapi version, and persisted settings match.
 4. Otherwise replace the stopped container, keeping its session volume; create in the first available slot.

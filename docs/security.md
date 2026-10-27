@@ -62,7 +62,7 @@ It does **not** protect against:
 - **Damage to the mounted directory.** Use git and [safer mode](recovery.md). Backups are local, unencrypted, and not off-site.
 - **Allowed network channels.** Full mode permits exfiltration. Allowlist mode limits destinations by hostname on 80/443 but does not inspect encrypted content; an allowed host remains a channel.
 - **Secrets intentionally made available.** `.env` in the workspace, the shared credentials volume, and `SAPI_ENV` values are readable by the agent and may reach the model provider.
-- **A compromised upstream or mutable build inputs.** npm, apt, base-image tags, and pi's default self-update can change independently of sapi. Pinning `SAPI_PI_VERSION` does not lock transitive npm dependencies. `SAPI_AUTO_UPDATE=0` prevents startup update attempts, but neither setting makes builds bit-reproducible or guarantees upstream availability. Use reviewed locks, mirrors, and image digests for stronger control.
+- **A compromised upstream or mutable software.** The default starting image is a tested snapshot pinned by digest, but automatic pi updates remain enabled and may select new npm dependencies. Source/custom builds also use mutable upstream inputs. `SAPI_AUTO_UPDATE=0` prevents startup update attempts; it does not make source builds bit-reproducible, prevent deliberate agent changes, or guarantee upstream availability. See [images and builds](images.md).
 - **An immutable audit trail.** Agents can modify their session files and settings. A diff compares two tree states; it does not record all actions or establish which process made a change. See [recovery](recovery.md).
 - **Host-wide network filtering.** The allowlist applies to the agent's runtime namespace, not Docker pulls, build-time package downloads, or other host processes.
 
@@ -70,6 +70,7 @@ It does **not** protect against:
 
 - The installer defaults to a release tag; `SAPI_REF=main` selects development. Downloads use HTTPS, shebang/syntax validation, and atomic replacement. GitHub/TLS is the authenticity root; a tag is a version pin, not an independent signature.
 - `sapi dockerfile` prints the complete effective image definition.
+- The agent starting image is digest-pinned and checked against the embedded recipe fingerprint, baked pi-version label, and root-user metadata. Each architecture's exact candidate passes kernel smoke before publication. Runtime updates remain a separate, default-enabled policy.
 - The sidecar image is digest-pinned, its source archive checksum-pinned, and its test-only hooks excluded from production builds.
 - GitHub Actions are commit-pinned; Rust dependencies are lockfile-pinned and checked with cargo-deny.
 

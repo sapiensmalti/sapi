@@ -4,6 +4,9 @@
 set -Eeuo pipefail
 # Every managed agent is root, independently of the host/CI user.
 export SAPI_UID=0 SAPI_GID=0
+# Legacy argv fixtures exercise source builds; distribution.sh separately
+# clears this override and verifies the published-image default.
+export SAPI_BUILD=1
 [[ "${DEBUG:-0}" == 1 ]] && set -x
 cd "$(dirname "$0")/.."
 
@@ -362,6 +365,13 @@ if bash test/safety.sh; then
     ok "safety regression suite (no Docker)"
 else
     bad "safety regression suite (no Docker)"
+fi
+
+echo "image distribution"
+if bash test/distribution.sh; then
+    ok "distribution regression suite (no Docker)"
+else
+    bad "distribution regression suite (no Docker)"
 fi
 
 echo "hygiene"

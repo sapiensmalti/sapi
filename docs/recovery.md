@@ -53,7 +53,7 @@ sapi run --json "Explain the test failures." > events.jsonl
 - Each task uses a new, automatically removed container. Its session files use a persistent per-workspace volume.
 - Default stdout is pi's final message; `--json` selects pi's event stream. Sapi diagnostics go to stderr.
 - Normal exit status is the agent/container's result. A timeout returns `124`; caught signals keep their usual statuses.
-- `--timeout S` begins after container launch, includes container startup/update time, and does **not** cover the preceding image build, backup, or sidecar setup. Stopping the container can add a grace period. `0` means no timeout.
+- `--timeout S` begins after container launch, includes container startup/update time, and does **not** cover the preceding image download/build, backup, or sidecar setup. Stopping the container can add a grace period. `0` means no timeout.
 - Sapi passes pi `--no-approve` to ignore project-local resources for the run. This is not a tool-approval mechanism or protection from prompt injection in files the agent reads.
 
 With safer mode, a normally completed `run` writes a `.run` summary beside its backup, including nonzero exits and timeouts. It contains the task's first 2,000 bytes with newlines flattened, the container, timestamps, exit code, requested model (or `default`), and sapi version. An interrupted run may leave a backup without a run summary. Redirect output to a file outside the workspace if you also need a host-side record of stdout/stderr; it may contain secrets.

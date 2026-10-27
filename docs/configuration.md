@@ -57,14 +57,15 @@ These are **not** accepted by `sapi config set`.
 | Variable | Default / meaning |
 |---|---|
 | `SAPI_MODEL` | Unset: pi selects the model. Otherwise passed to `pi --model`. |
-| `SAPI_PI_VERSION` | `latest`; pi version requested when building the image |
-| `SAPI_AUTO_UPDATE` | `1`; `0` disables pi's update attempt on agent start |
-| `SAPI_REBUILD` | `0`; `1` rebuilds with `--no-cache --pull` |
+| `SAPI_PI_VERSION` | Published starting version (`1.4.0`); a different version or `latest` selects a full-source build. Startup updates are separate. |
+| `SAPI_AUTO_UPDATE` | `1`, unchanged for published images; `0` disables pi's update attempt on agent start |
+| `SAPI_BUILD` | `0`; `1` selects the full embedded source recipe instead of the published base |
+| `SAPI_REBUILD` | `0`; `1` forces a full-source build with `--no-cache --pull` |
 | `SAPI_UID` / `SAPI_GID` | Legacy compatibility controls: agent commands accept only `0`; all agents/shells start as `0:0` |
 | `SAPI_CONFIG_VOLUME` | `sapi-config`; shared pi credentials/settings volume |
 | `SAPI_ENV` | Empty; whitespace-separated names of host variables to pass through |
 | `SAPI_DOCKER_ARGS` | Empty; extra Docker arguments, whitespace-split without quote interpretation or glob expansion |
-| `SAPI_IMAGE` | Override the agent image name/tag; pre-pull a custom image, otherwise sapi builds under that name |
+| `SAPI_IMAGE` | Use an existing image as supplied, or build the selected recipe under this name/tag if missing; custom digest references must be pre-pulled |
 | `SAPI_EGRESS_IMAGE` | Override the digest-pinned sidecar image |
 | `SAPI_EGRESS_BUILD` | `1` builds the sidecar from checksum-pinned source instead of pulling it |
 
@@ -103,4 +104,4 @@ Sapi upgrades do not directly update pi. Pinning `SAPI_PI_VERSION` pins the requ
 SAPI_PI_VERSION=1.4.0 SAPI_AUTO_UPDATE=0 sapi
 ```
 
-Image tags describe build inputs, not a lock of npm, apt, or base-image contents. See [supply-chain limits](security.md#threat-model) before treating a build as reproducible.
+The default image digest fixes the starting bytes, but automatic updates remain enabled and can change the running installation. Source/customized builds depend on additional mutable inputs. See [images and builds](images.md) and [supply-chain limits](security.md#threat-model); do not confuse a pinned starting image with a frozen running agent.

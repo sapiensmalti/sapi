@@ -11,6 +11,10 @@ SAPI_REF_CUSTOM=0; [[ -n "${SAPI_REF:-}" ]] && SAPI_REF_CUSTOM=1
 readonly SAPI_REF_CUSTOM
 readonly SAPI_REF="${SAPI_REF:-v0.6.1}"
 readonly IMAGE_REPOSITORY="sapi"
+# Reviewed starting version; automatic startup updates remain enabled.
+readonly AGENT_PI_VERSION="1.4.0"
+readonly AGENT_VERSION="0.1.0"
+readonly AGENT_IMAGE="ghcr.io/sapiensmalti/sapi-agent@sha256:a0c6521c80e33db681b63ab2ca861684bb8607598625118e16f65f2aadf0277b"
 readonly CONFIG_VOLUME="${SAPI_CONFIG_VOLUME:-sapi-config}"
 readonly LABEL="sh.sapi"
 
@@ -102,6 +106,7 @@ die() { printf 'sapi: %s\n' "$*" >&2; exit "$ERROR_STATUS"; }
 log() { printf 'sapi: %s\n' "$*" >&2; }
 
 # One exit hook for every transient resource; each is a no-op until set.
+BUILD_CTX=""
 BACKUP_PARTIAL=""; BACKUP_TXN=""; BACKUP_LOCK=""; BACKUP_REAP=""; DIFF_TMP=""
 RESTORE_TMP=""; RESTORE_TXN=""; RESTORE_DEST=""; RESTORE_COMMITTED=0
 EGRESS_STOP_NAME=""; RUN_STOP_NAME=""; RUN_TIMER_PID=""; RUN_TMP=""
@@ -112,6 +117,7 @@ on_exit() {
     [[ -n "$RUN_TIMER_PID" ]] && { kill "$RUN_TIMER_PID" 2>/dev/null; wait "$RUN_TIMER_PID" 2>/dev/null; }
     [[ -n "$RUN_STOP_NAME" ]] && docker rm --force "$RUN_STOP_NAME" >/dev/null 2>&1
     [[ -n "$EGRESS_STOP_NAME" ]] && docker rm --force "$EGRESS_STOP_NAME" >/dev/null 2>&1
+    [[ -n "$BUILD_CTX" ]] && rm -rf -- "$BUILD_CTX"
     [[ -n "$BACKUP_PARTIAL" ]] && rm -f -- "$BACKUP_PARTIAL"
     [[ -n "$BACKUP_TXN" ]] && rm -rf -- "$BACKUP_TXN"
     [[ -n "$BACKUP_LOCK" ]] && { rm -f -- "$BACKUP_LOCK/pid"; rmdir -- "$BACKUP_LOCK" 2>/dev/null; }
@@ -163,17 +169,18 @@ Usage:
                      Bash in /pi-sessions: join a running agent (inherit its network/mounts),
                      or start a temporary shell (no network unless --net; then full network)
   sapi netlog [NAME] Print available egress-sidecar logs when using allowlist mode (does not follow)
-  sapi build         Build the image without starting a container
-  sapi dockerfile    Print the effective Dockerfile, including user customizations
+  sapi build         Fetch the published image, or build a custom/source image, without starting
+  sapi dockerfile    Print the selected recipe; SAPI_BUILD=1 prints the full embedded source
   sapi upgrade       Upgrade sapi itself
   sapi version       Print version
   sapi help          Show this help
 
 Environment:
   SAPI_MODEL          Model for pi --model (default: pi decides)
-  SAPI_PI_VERSION     pi npm version to install in the image (default: latest)
-  SAPI_AUTO_UPDATE=0  Do not run 'pi update' on container start
-  SAPI_REBUILD=1      Rebuild the image from scratch
+  SAPI_PI_VERSION     pi npm version to install in source builds (default: $AGENT_PI_VERSION)
+  SAPI_AUTO_UPDATE=0  Disable startup pi updates (default: enabled, including with published images)
+  SAPI_BUILD=1       Use the full embedded source recipe instead of the published base
+  SAPI_REBUILD=1     Force a full-source rebuild with --no-cache --pull
   SAPI_UID / SAPI_GID Legacy controls: only 0 is accepted; agents and shells always start as 0:0
   SAPI_CONFIG_VOLUME  Docker volume for pi config and credentials (default: sapi-config)
   SAPI_ENV            Space-separated host variables to pass through, e.g. "ANTHROPIC_API_KEY GH_TOKEN"
@@ -216,7 +223,7 @@ inspect() { docker container inspect --format "$2" "$1" 2>/dev/null || true; }
 label()   { inspect "$1" "{{index .Config.Labels \"$LABEL.$2\"}}"; }
 
 require_docker() {
-    command -v docker >/dev/null 2>&1 || die "docker not found. See: https://github.com/$SAPI_REPO#install"
+    command -v docker >/dev/null 2>&1 || die "docker not found. See: https://github.com/$SAPI_REPO#install-and-start"
     if ! docker info >/dev/null 2>&1; then
         if [[ "$OS" == "Darwin" ]] && command -v open >/dev/null 2>&1; then
             log "Docker is not running; trying to start OrbStack or Docker Desktop ..."
@@ -227,6 +234,11 @@ require_docker() {
     docker info >/dev/null 2>&1 || die "Docker is not running or you lack permission (on Linux: sudo usermod -aG docker \$USER, then re-login)."
 }
 
+require_buildx() {
+    docker buildx version >/dev/null 2>&1 \
+        || die "local image builds require Docker Buildx; install docker-buildx-plugin or use the published base without customizations"
+}
+
 # ---------------------------------------------------------------------------
 # Context
 # ---------------------------------------------------------------------------
@@ -235,9 +247,10 @@ WORKSPACE="$(pwd -P)"
 WORKSPACE_HASH="$(printf '%s' "$WORKSPACE" | sha256)"
 CONFIG_FILE="${SAPI_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/sapi/config}"
 readonly CONFIG_FILE
-PI_VERSION="${SAPI_PI_VERSION:-latest}"
+PI_VERSION="${SAPI_PI_VERSION:-$AGENT_PI_VERSION}"
 MODEL="${SAPI_MODEL:-}"
 REBUILD="${SAPI_REBUILD:-0}"
+SOURCE_BUILD="${SAPI_BUILD:-0}"
 AUTO_UPDATE="${SAPI_AUTO_UPDATE:-1}"
 normalize_identity() {
     local value="$1"
@@ -247,22 +260,27 @@ normalize_identity() {
 }
 UID_="$(normalize_identity "${SAPI_UID:-0}")"
 GID_="$(normalize_identity "${SAPI_GID:-0}")"
-readonly OS WORKSPACE WORKSPACE_HASH PI_VERSION MODEL REBUILD AUTO_UPDATE UID_ GID_
+readonly OS WORKSPACE WORKSPACE_HASH PI_VERSION MODEL REBUILD SOURCE_BUILD AUTO_UPDATE UID_ GID_
 
 [[ "$REBUILD" == 0 || "$REBUILD" == 1 ]] || die "SAPI_REBUILD must be 0 or 1"
+[[ "$SOURCE_BUILD" == 0 || "$SOURCE_BUILD" == 1 ]] || die "SAPI_BUILD must be 0 or 1"
 [[ "$AUTO_UPDATE" == 0 || "$AUTO_UPDATE" == 1 ]] || die "SAPI_AUTO_UPDATE must be 0 or 1"
 require_agent_identity() {
     [[ "$UID_:$GID_" == 0:0 ]] || die "container identity is fixed at root (0:0); unset SAPI_UID/SAPI_GID or set both to 0"
 }
 
-# The effective Dockerfile is the embedded one plus the user's toolchain
-# customisation (see `packages` and `dockerfile_extra`). The image tag is a
-# hash of everything that goes into it, so any change yields a new image and
-# an unchanged definition is never rebuilt. Resolved after settings are read.
-IMAGE=""; EFFECTIVE_DOCKERFILE=""
+# Published images freeze the starting bytes, not later pi self-updates.
+# Full-source builds are explicit; custom tools normally extend the pinned base.
+IMAGE=""; EFFECTIVE_DOCKERFILE=""; IMAGE_USES_BASE=0; AGENT_DEFINITION=""
 resolve_image() {
     [[ -n "$IMAGE" ]] && return 0
-    EFFECTIVE_DOCKERFILE="$DOCKERFILE"
+    AGENT_DEFINITION="$(printf '%s\n%s\n' "$AGENT_PI_VERSION" "$DOCKERFILE" | sha256)"
+    if [[ "$SOURCE_BUILD" == 1 || "$REBUILD" == 1 || "$PI_VERSION" != "$AGENT_PI_VERSION" ]]; then
+        EFFECTIVE_DOCKERFILE="$DOCKERFILE"
+    else
+        IMAGE_USES_BASE=1
+        EFFECTIVE_DOCKERFILE="FROM $AGENT_IMAGE"
+    fi
     if [[ -n "${SET_packages:-}" ]]; then
         EFFECTIVE_DOCKERFILE+="
 # --- sapi: packages (from \`sapi config\` / SAPI_PACKAGES) ---
@@ -278,7 +296,32 @@ $(cat "$SET_dockerfile_extra")
 # sapi's runtime identity is fixed, even after a user fragment.
 USER 0:0"
     fi
-    IMAGE="${SAPI_IMAGE:-$IMAGE_REPOSITORY:$(printf '%s\n%s\n' "$PI_VERSION" "$EFFECTIVE_DOCKERFILE" | sha256 | cut -c1-12)}"
+    if [[ -n "${SAPI_IMAGE:-}" ]]; then
+        IMAGE="$SAPI_IMAGE"
+    elif [[ "$IMAGE_USES_BASE" == 1 && -z "$SET_packages" && ! -f "$SET_dockerfile_extra" ]]; then
+        IMAGE="$AGENT_IMAGE"
+    else
+        IMAGE="$IMAGE_REPOSITORY:$(printf '%s\n%s\n' "$PI_VERSION" "$EFFECTIVE_DOCKERFILE" | sha256 | cut -c1-12)"
+    fi
+}
+
+ensure_agent_image() {
+    if ! docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1; then
+        log "pulling agent image $AGENT_VERSION (starting pi $AGENT_PI_VERSION; startup updates unchanged) ..."
+        docker pull --quiet "$AGENT_IMAGE" >/dev/null \
+            || die "agent image unavailable; retry, or explicitly use SAPI_BUILD=1 to build the embedded source"
+    fi
+    local actual
+    actual="$(docker image inspect --format '{{index .Config.Labels "sh.sapi.agent-definition"}}' "$AGENT_IMAGE")" \
+        || die "cannot inspect agent image definition"
+    [[ "$actual" == "$AGENT_DEFINITION" ]] \
+        || die "agent image definition mismatch; use a matching sapi release or explicitly set SAPI_BUILD=1"
+    actual="$(docker image inspect --format '{{index .Config.Labels "sh.sapi.pi-version"}}' "$AGENT_IMAGE")" \
+        || die "cannot inspect agent image pi version"
+    [[ "$actual" == "$AGENT_PI_VERSION" ]] || die "agent image starting pi version mismatch"
+    actual="$(docker image inspect --format '{{.Config.User}}' "$AGENT_IMAGE")" \
+        || die "cannot inspect agent image root identity"
+    [[ "$actual" == 0:0 ]] || die "agent image does not declare root (0:0)"
 }
 
 # ---------------------------------------------------------------------------
@@ -487,11 +530,12 @@ egress_image() {
         EGRESS_IMAGE_REF="$EGRESS_LOCAL_IMAGE"
         if ! docker image inspect "$EGRESS_IMAGE_REF" >/dev/null 2>&1; then
             log "egress: building $EGRESS_IMAGE_REF from pinned source ($EGRESS_SOURCE_URL) ..."
-            local ctx; ctx="$(mktemp -d)"
+            require_buildx
+            BUILD_CTX="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/sapi-build.XXXXXX")"
             printf '%s\n' "$EGRESS_DOCKERFILE" | DOCKER_BUILDKIT=1 docker build --tag "$EGRESS_IMAGE_REF" \
-                --build-arg "SRC_URL=$EGRESS_SOURCE_URL" --build-arg "SRC_SHA256=$EGRESS_SOURCE_SHA256" -f - "$ctx" \
+                --build-arg "SRC_URL=$EGRESS_SOURCE_URL" --build-arg "SRC_SHA256=$EGRESS_SOURCE_SHA256" -f - "$BUILD_CTX" >&2 \
                 || die "egress: source build failed"
-            rmdir "$ctx"
+            rmdir -- "$BUILD_CTX"; BUILD_CTX=""
         fi
     else
         EGRESS_IMAGE_REF="$EGRESS_IMAGE"
@@ -881,14 +925,23 @@ cmd_restore() {
 # ---------------------------------------------------------------------------
 cmd_build() {
     resolve_settings; resolve_image; require_docker
-    if [[ "$REBUILD" == 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-        local opts=(--tag "$IMAGE" --build-arg "PI_VERSION=$PI_VERSION")
-        [[ "$REBUILD" == 1 ]] && opts+=(--no-cache --pull)
-        log "building $IMAGE ...${SET_packages:+ (packages: $SET_packages)}"
-        local ctx; ctx="$(mktemp -d)"
-        printf '%s\n' "$EFFECTIVE_DOCKERFILE" | DOCKER_BUILDKIT=1 docker build "${opts[@]}" -f - "$ctx"
-        rmdir "$ctx"
+    if [[ "$IMAGE" == "$AGENT_IMAGE" && "$REBUILD" == 0 ]]; then
+        ensure_agent_image
+        return 0
     fi
+    # An explicit cached image is used as supplied; a cached customized image
+    # does not need its base re-downloaded. SAPI_REBUILD always forces a build.
+    if [[ "$REBUILD" == 0 ]] && docker image inspect "$IMAGE" >/dev/null 2>&1; then return 0; fi
+    [[ "$IMAGE" != *@* ]] || die "cannot build under a digest reference; pre-pull the custom image or choose an output tag"
+    require_buildx
+    [[ "$IMAGE_USES_BASE" == 1 ]] && ensure_agent_image
+    local opts=(--tag "$IMAGE")
+    [[ "$IMAGE_USES_BASE" == 0 ]] && opts+=(--build-arg "PI_VERSION=$PI_VERSION")
+    [[ "$REBUILD" == 1 ]] && opts+=(--no-cache --pull)
+    log "building $IMAGE ...${SET_packages:+ (packages: $SET_packages)}"
+    BUILD_CTX="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/sapi-build.XXXXXX")"
+    printf '%s\n' "$EFFECTIVE_DOCKERFILE" | DOCKER_BUILDKIT=1 docker build "${opts[@]}" -f - "$BUILD_CTX" >&2
+    rmdir -- "$BUILD_CTX"; BUILD_CTX=""
 }
 
 cmd_dockerfile() { resolve_settings; resolve_image; printf '%s\n' "$EFFECTIVE_DOCKERFILE"; }

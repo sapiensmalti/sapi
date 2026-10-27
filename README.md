@@ -4,7 +4,7 @@
 
 [pi](https://github.com/earendil-works/pi) in Docker, scoped to the directory you run it from.
 
-**Version note:** this page describes `main`. Root-only execution and cgroup-based allowlisting are not in the installer's selected sapi release (`v0.6.1`); use the explicit development install below to get these changes.
+**Version note:** this page describes `main`. Root-only execution, cgroup-based allowlisting, and published agent images are not in the installer's selected sapi release (`v0.6.1`); use the explicit development install below to get these changes.
 
 sapi mounts the current directory at `/workspace`. Agents, pi updates, and shells run as **root inside their own containers** on every platform. Credentials, settings, and session history live in Docker volumes. It does not mount your home directory, SSH agent, or Docker socket by default.
 
@@ -12,7 +12,7 @@ sapi mounts the current directory at `/workspace`. Agents, pi updates, and shell
 
 ## Install and start
 
-Requirements: macOS or Linux, Bash, `curl`, standard Unix tools, and Docker 23+ with Buildx. Debian 12+ is the documented Linux setup; the launcher also works on other distributions.
+Requirements: macOS or Linux, Bash, `curl`, standard Unix tools, and Docker 23+. Buildx is needed for custom/source builds, not normal published-image starts. Debian 12+ is the documented Linux setup; the launcher also works on other distributions.
 
 - **macOS:** [OrbStack](https://orbstack.dev) or Docker Desktop.
 - **Debian:** follow [Docker's installation guide](https://docs.docker.com/engine/install/debian/). The distribution's `docker.io` package may be too old.
@@ -28,7 +28,7 @@ The command above opts into `main`; omitting `SAPI_REF=main` installs the select
 
 The installer copies one executable to `~/.local/bin`, without sudo or shell-profile edits. If needed, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile. You can [read the installer](install.sh) before running it.
 
-First start builds a Linux image and needs network access; build time depends on the runtime and downloads. Agent starts also attempt to update pi by default. Inside pi, use `/login` to configure a provider. Alternatively, pass an already-exported API key by name:
+First start downloads a tested, digest-pinned Linux image; later starts reuse it locally. **Pi still attempts to update on agent start by default**, so startup remains network-dependent and the running software can change. Set `SAPI_AUTO_UPDATE=0` to skip that update. See [images and builds](docs/images.md). Inside pi, use `/login` to configure a provider. Alternatively, pass an already-exported API key by name:
 
 ```sh
 SAPI_ENV=OPENROUTER_API_KEY sapi
@@ -54,7 +54,7 @@ For an unattended task:
 sapi --safer run --timeout 900 "Run the tests and fix the failures."
 ```
 
-The final message goes to stdout; sapi diagnostics go to stderr. `--json` returns pi's event stream. The timeout begins at container launch, not during the preceding image build or backup.
+The final message goes to stdout; sapi diagnostics go to stderr. `--json` returns pi's event stream. The timeout begins at container launch, not during the preceding image download/build or backup.
 
 ## Agents and shells
 
@@ -85,8 +85,9 @@ Config-file settings use flag > environment > config > default precedence. Other
 
 - [Toolchains](docs/toolchain.md): extra Debian packages and user Dockerfile fragments.
 - [Network allowlist](docs/network.md): hostname filtering on ports 80/443; off by default. Uses a separate cgroup-based proxy boundary; see [identity and isolation](docs/security.md#agent-identity).
-- `sapi dockerfile`: print the effective Dockerfile, including customizations.
-- `sapi build`: build or reuse the image without starting an agent.
+- [Images and builds](docs/images.md): published starting images, custom layers, explicit source builds, and update limits.
+- `sapi dockerfile`: print the selected build recipe; `SAPI_BUILD=1 sapi dockerfile` shows the full source recipe.
+- `sapi build`: fetch/build/reuse the selected image without starting an agent.
 - `sapi help`: command reference.
 
 ## Upgrade and remove
@@ -99,7 +100,7 @@ To uninstall, remove `~/.local/bin/sapi` (or your chosen install path). Before d
 
 The Bash launcher embeds the agent Dockerfile and entrypoint; `egress/` contains the optional Rust sidecar. See [architecture](docs/architecture.md).
 
-- `test/check.sh`: lint and launcher tests, including `bash test/recovery.sh` and `bash test/safety.sh` for failure paths, concurrency, and validation. No Docker required.
+- `test/check.sh`: lint and launcher tests, including recovery, safety, and distribution suites for failure paths, concurrency, validation, and image selection. No Docker required.
 - `test/smoke.sh`: real Docker builds, ownership, recovery, and firewall checks.
 - `egress/`: formatting, strict clippy, tests, and cargo-deny; commands are in [CI](.github/workflows/ci.yml).
 

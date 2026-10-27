@@ -12,7 +12,10 @@ REAL_HOME="$HOME"; test_root="$(mktemp -d)"; test_root="$(cd "$test_root" && pwd
 export DOCKER_CONFIG="${DOCKER_CONFIG:-$REAL_HOME/.docker}"
 export HOME="$test_root/home"; mkdir -p "$HOME"
 export SAPI_CONFIG_FILE="$HOME/config" SAPI_BACKUP_DIR="$HOME/backups"
-export SAPI_CONFIG_VOLUME="$TEST_ID-config" SAPI_IMAGE="sapi:$TEST_ID"
+export SAPI_CONFIG_VOLUME="$TEST_ID-config"
+AGENT_CANDIDATE="${SAPI_SMOKE_AGENT_IMAGE:-}"
+export SAPI_IMAGE="${AGENT_CANDIDATE:-sapi:$TEST_ID}"
+export SAPI_BUILD="${SAPI_SMOKE_SOURCE_BUILD:-0}"
 EGRESS_CONTAINER="$TEST_ID-egress"
 # Release jobs can test an already-built candidate without rebuilding or
 # deleting it. Normal CI/developer runs continue to build this checkout.
@@ -41,7 +44,8 @@ cleanup() {
             --mount "type=bind,source=$test_root,target=/test-fixtures" --entrypoint /bin/sh \
             "$SAPI_IMAGE" -c 'find /test-fixtures -mindepth 1 -delete' >/dev/null 2>&1
     fi
-    docker image rm -f "$PROBE_IMAGE" "$PKG_IMAGE" "$SAPI_IMAGE" >/dev/null 2>&1
+    docker image rm -f "$PROBE_IMAGE" "$PKG_IMAGE" >/dev/null 2>&1
+    [[ -z "$AGENT_CANDIDATE" ]] && docker image rm -f "$SAPI_IMAGE" >/dev/null 2>&1
     [[ -z "$EGRESS_CANDIDATE" ]] && docker image rm -f "$EGRESS_IMAGE" >/dev/null 2>&1
     rm -rf -- "$test_root"
     exit "$rc"
@@ -49,7 +53,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo 'build'
-if ./sapi build; then ok 'image builds'; else bad 'image builds'; exit 1; fi
+if [[ -n "$AGENT_CANDIDATE" ]]; then
+    docker image inspect "$SAPI_IMAGE" >/dev/null || { bad 'agent candidate image is missing'; exit 1; }
+    ok "testing existing agent candidate $SAPI_IMAGE"
+fi
+if ./sapi build; then ok 'image is ready'; else bad 'image preparation'; exit 1; fi
 harden=(--security-opt no-new-privileges --cap-drop ALL
     --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --cap-add FOWNER
     --cap-add SETUID --cap-add SETGID)

@@ -6,7 +6,7 @@ S="$PWD/sapi"
 tmp="$(mktemp -d)"; tmp="$(cd "$tmp" && pwd -P)"
 trap 'rm -rf -- "$tmp"' EXIT
 export HOME="$tmp/home" SAPI_CONFIG_FILE="$tmp/config" SAPI_BACKUP_DIR="$tmp/backups"
-export SAPI_UID=0 SAPI_GID=0
+export SAPI_UID=0 SAPI_GID=0 SAPI_BUILD=1
 unset SAPI_DOCKER_ARGS SAPI_ENV SAPI_IMAGE SAPI_NETWORK SAPI_ALLOW SAPI_SAFER
 mkdir -p "$HOME" "$tmp/bin" "$tmp/work"
 export CALLS="$tmp/calls"
