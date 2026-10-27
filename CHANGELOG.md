@@ -4,6 +4,10 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ## Unreleased
 
+- Use tested, digest-pinned amd64/arm64 agent starting images by default; verify the embedded-recipe fingerprint, baked pi version, and root metadata. Automatic pi updates remain enabled by default.
+- Build custom tools as layers on the published base. Retain explicit full-source builds through `SAPI_BUILD=1`, alternate pi versions, and forced rebuilds; never silently fall back after image/metadata failure.
+- Gate exact agent-image candidates on native kernel smoke before publication, publish source/build metadata, clean failed build contexts, and keep preparation output off headless stdout.
+
 - Fail closed on invalid environment overrides; preserve intentionally empty config lists and return `2` for all diff validation failures.
 - Enforce container root (`0:0`) for every managed agent, pi updater, and shell on all platforms. Reject non-root identity requests, override conflicting Docker user/entrypoint flags, and verify real root credentials at the entrypoint. Linux workspace files may consequently be root-owned.
 - Replace proxy-UID firewall exemptions with exact cgroup-v2 membership; require compatible readiness and fail closed on legacy images/unsupported kernels. Pin sapi-egress 0.1.3 by verified image digest and source checksum; gate each architecture's publication on exact-image kernel smoke tests.

@@ -46,7 +46,7 @@ if ! command -v docker >/dev/null 2>&1; then
   Docker is not installed. sapi needs it for isolation.
     macOS:   brew install orbstack        (or Docker Desktop)
     Debian:  https://docs.docker.com/engine/install/debian/
-             Install Docker 23+ with the Buildx plugin; docker.io may be too old.
+             Use Docker 23+; add Buildx for local builds. docker.io may be too old.
     Linux:   docker info must work as your normal user.
              Docker group membership grants root-equivalent host access.
 EOF

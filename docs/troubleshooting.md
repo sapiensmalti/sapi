@@ -6,7 +6,7 @@
 Run `~/.local/bin/sapi`, or add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile. If you used `SAPI_INSTALL_DIR`, use that path instead.
 
 **Docker is missing or the build rejects heredoc syntax**
-Use Docker 23+ with Buildx. On macOS, install [OrbStack](https://orbstack.dev) or Docker Desktop. On Debian, follow [Docker's installation guide](https://docs.docker.com/engine/install/debian/); the distribution's `docker.io` may be too old.
+Use Docker 23+. Normal published-image starts do not require Buildx, but local builds do. On macOS, install [OrbStack](https://orbstack.dev) or Docker Desktop. On Debian, follow [Docker's installation guide](https://docs.docker.com/engine/install/debian/); the distribution's `docker.io` may be too old.
 
 **Docker is not running, or permission is denied**
 Check `docker info`. Start your macOS Docker provider; sapi attempts to open OrbStack or Docker Desktop automatically. On Debian, ensure the daemon is running and your user has access. `sudo usermod -aG docker "$USER"` requires logging out/in and grants root-equivalent host access. Do not run sapi with sudo merely to bypass the error.
@@ -15,7 +15,13 @@ Check `docker info`. Start your macOS Docker provider; sapi attempts to open Orb
 `sapi` and `sapi shell` need a terminal. For scripts, pipes, or cron, use `sapi run TASK` or pipe a task to `sapi run -`.
 
 **Startup is slow, or npm/apt returns a download error**
-The first build downloads base images and packages; pi also attempts a startup update by default. A registry can advertise a version before its tarball is available. Check the failing URL/service before retrying; repeated clean builds do not fix a missing upstream artifact. `SAPI_AUTO_UPDATE=0` skips the startup update, not the initial build. Version pins and limits are in [configuration](configuration.md#versions-and-installation).
+Normal preparation downloads a tested image rather than building npm/apt locally. Pi still attempts a startup update by default; `SAPI_AUTO_UPDATE=0` skips that attempt, not any required image pull. Custom/source builds and updates can still encounter a registry advertising a version before its archive is available. Check the failing URL/service before retrying; repeated clean builds do not repair missing upstream artifacts. See [images and builds](images.md).
+
+**The published image is unavailable or its metadata does not match**
+Check registry access and use a matching sapi version. No mutable-image fallback happens automatically. `SAPI_BUILD=1 sapi` explicitly selects the embedded source recipe, which needs Buildx and upstream build inputs. Never remove integrity checks just to start.
+
+**A local build needs Buildx**
+Install Docker's Buildx plugin (`docker-buildx-plugin` in Docker's Debian packages). A normal cached/published image does not need it. `SAPI_REBUILD=1` forces a full-source build and therefore needs Buildx too.
 
 **I need a clean image build**
 `SAPI_REBUILD=1 sapi build` pulls base images and rebuilds without cache. It does not clear credentials, session volumes, or old images.

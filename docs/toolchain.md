@@ -7,7 +7,7 @@ The default image contains Debian, Node, pi, git, ripgrep, jq, curl, an SSH clie
 ```sh
 sapi config set packages "golang make postgresql-client"     # or: SAPI_PACKAGES="golang make"
 sapi dockerfile | tail -5                                      # see exactly what will be built
-sapi                                                           # builds once; cached by content
+sapi                                                           # builds a layer on the published base
 ```
 
 Names are validated as Debian package names (`[a-z0-9][a-z0-9+.-]+`), comma or space separated. They are installed in one `apt-get install --no-install-recommends` layer appended to the embedded Dockerfile.
@@ -28,9 +28,9 @@ The agent is always launched as root. Sapi appends `USER 0:0` after fragments an
 
 ## How caching works
 
-The image tag uses the first 12 hex digits of SHA-256 over the requested pi version string and effective Dockerfile. Changing packages or the fragment changes the tag; an existing tag is reused, a missing image is built. `SAPI_REBUILD=1` forces `--no-cache --pull`. Mutable base/package sources mean this is caching, not a complete dependency lock. Old tagged images remain until explicitly removed with `docker image rm IMAGE`; ordinary `docker image prune` removes dangling images, not all old tagged sapi images.
+Custom tools normally add a layer on the digest-pinned agent image, without reinstalling pi. `SAPI_BUILD=1` or a different `SAPI_PI_VERSION` uses the full source recipe instead. Custom/source tags use the first 12 hex digits of SHA-256 over the requested pi version and effective recipe, including the base digest. A changed recipe gets a new tag; a cached image is reused. `SAPI_REBUILD=1` forces a full-source `--no-cache --pull` build. Custom package sources are still mutable; this is caching, not a complete dependency lock. Old tagged images remain until explicitly removed with `docker image rm IMAGE`; ordinary `docker image prune` removes dangling images, not all old tagged sapi images.
 
-`sapi dockerfile` always prints the complete effective Dockerfile. There is nothing hidden between what you read and what gets built.
+`sapi dockerfile` prints the selected recipe. With the published base it starts with a pinned `FROM`; `SAPI_BUILD=1 sapi dockerfile` shows the full embedded source. Buildx is needed for local builds. See [images and builds](images.md).
 
 ## Why only user-level
 

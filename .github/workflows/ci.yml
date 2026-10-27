@@ -72,7 +72,12 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: test/smoke.sh
+      - name: published-base and custom-layer smoke
+        run: test/smoke.sh
+      - name: explicit full-source build smoke
+        env:
+          SAPI_SMOKE_SOURCE_BUILD: 1
+        run: test/smoke.sh
 
   macos-smoke:
     runs-on: macos-latest
