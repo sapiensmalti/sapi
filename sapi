@@ -11,6 +11,8 @@ SAPI_REF_CUSTOM=0; [[ -n "${SAPI_REF:-}" ]] && SAPI_REF_CUSTOM=1
 readonly SAPI_REF_CUSTOM
 readonly SAPI_REF="${SAPI_REF:-v0.6.1}"
 readonly IMAGE_REPOSITORY="sapi"
+# Reviewed starting version; automatic startup updates remain enabled.
+readonly AGENT_PI_VERSION="1.4.0"
 readonly CONFIG_VOLUME="${SAPI_CONFIG_VOLUME:-sapi-config}"
 readonly LABEL="sh.sapi"
 
@@ -171,7 +173,7 @@ Usage:
 
 Environment:
   SAPI_MODEL          Model for pi --model (default: pi decides)
-  SAPI_PI_VERSION     pi npm version to install in the image (default: latest)
+  SAPI_PI_VERSION     pi npm version to install in source builds (default: $AGENT_PI_VERSION)
   SAPI_AUTO_UPDATE=0  Do not run 'pi update' on container start
   SAPI_REBUILD=1      Rebuild the image from scratch
   SAPI_UID / SAPI_GID Legacy controls: only 0 is accepted; agents and shells always start as 0:0
@@ -235,7 +237,7 @@ WORKSPACE="$(pwd -P)"
 WORKSPACE_HASH="$(printf '%s' "$WORKSPACE" | sha256)"
 CONFIG_FILE="${SAPI_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/sapi/config}"
 readonly CONFIG_FILE
-PI_VERSION="${SAPI_PI_VERSION:-latest}"
+PI_VERSION="${SAPI_PI_VERSION:-$AGENT_PI_VERSION}"
 MODEL="${SAPI_MODEL:-}"
 REBUILD="${SAPI_REBUILD:-0}"
 AUTO_UPDATE="${SAPI_AUTO_UPDATE:-1}"

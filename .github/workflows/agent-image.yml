@@ -1,0 +1,130 @@
+name: agent-image
+# Publish only exact, kernel-tested candidates. A tag creates a component
+# image release; it does not change the sapi installer or startup update policy.
+on:
+  push:
+    tags: ["agent-v*"]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/sapi-agent
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, arch: amd64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: test/check.sh
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and test exact candidate before publication
+        run: |
+          pi_version="$(awk -F '"' '/^readonly AGENT_PI_VERSION=/ {print $2}' sapi)"
+          [[ "$pi_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ctx="$(mktemp -d)"
+          recipe="$RUNNER_TEMP/agent.Dockerfile"
+          SAPI_BUILD=1 SAPI_PI_VERSION="$pi_version" SAPI_PACKAGES= \
+            SAPI_CONFIG_FILE="$ctx/absent-config" SAPI_DOCKERFILE_EXTRA="$ctx/absent-fragment" \
+            ./sapi dockerfile > "$recipe"
+          definition="$( { printf '%s\n' "$pi_version"; cat "$recipe"; } | sha256sum | cut -d' ' -f1)"
+          candidate="$IMAGE:${GITHUB_REF_NAME}-${{ matrix.arch }}"
+          docker build --build-arg "PI_VERSION=$pi_version" \
+            --label "sh.sapi.agent-definition=$definition" \
+            --label "sh.sapi.pi-version=$pi_version" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=${GITHUB_REF_NAME#agent-v}" \
+            -f "$recipe" -t "$candidate" "$ctx"
+          before="$(docker image inspect --format '{{.Id}}' "$candidate")"
+          test "$(docker image inspect --format '{{.Config.User}}' "$candidate")" = 0:0
+          test "$(docker run --rm --network none -e SAPI_AUTO_UPDATE=0 "$candidate" --version)" = "$pi_version"
+          SAPI_SMOKE_SOURCE_BUILD=1 SAPI_SMOKE_AGENT_IMAGE="$candidate" test/smoke.sh
+          test "$(docker image inspect --format '{{.Id}}' "$candidate")" = "$before"
+          docker push "$candidate"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$candidate" | cut -d@ -f2 > "agent-digest-${{ matrix.arch }}"
+          printf '%s\n' "$definition" > "agent-definition-${{ matrix.arch }}"
+          printf '%s\n' "$pi_version" > "agent-pi-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            agent-digest-${{ matrix.arch }}
+            agent-definition-${{ matrix.arch }}
+            agent-pi-${{ matrix.arch }}
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: meta
+          merge-multiple: true
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: merge verified architectures and record pins
+        run: |
+          version="${GITHUB_REF_NAME#agent-v}"
+          amd64="$(cat meta/agent-digest-amd64)"; arm64="$(cat meta/agent-digest-arm64)"
+          [[ "$amd64" =~ ^sha256:[0-9a-f]{64}$ && "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          cmp meta/agent-definition-amd64 meta/agent-definition-arm64
+          cmp meta/agent-pi-amd64 meta/agent-pi-arm64
+          docker buildx imagetools create -t "$IMAGE:$version" "$IMAGE@$amd64" "$IMAGE@$arm64"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$version" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'image = %s@%s\npi_version = %s\ndefinition_sha256 = %s\n' \
+            "$IMAGE" "$digest" "$(cat meta/agent-pi-amd64)" "$(cat meta/agent-definition-amd64)" > PINS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-pins
+          path: PINS
+          if-no-files-found: error
+
+  source:
+    needs: merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-pins
+      - name: publish source and build metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#agent-v}"
+          archive="sapi-agent-src-$version.tar.gz"
+          git archive --format=tar.gz --prefix=sapi-agent/ "$GITHUB_REF_NAME" > "$archive"
+          sha256sum "$archive" > SHA256SUMS
+          printf 'source_sha256 = %s\n' "$(cut -d' ' -f1 SHA256SUMS)" >> PINS
+          gh release create "$GITHUB_REF_NAME" "$archive" SHA256SUMS PINS \
+            --title "sapi-agent $version" \
+            --notes 'Tested amd64/arm64 root-agent base. PINS records the immutable image, baked pi version, and source/definition checksums. Startup pi updates remain a separate client setting.'

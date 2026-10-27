@@ -57,7 +57,7 @@ These are **not** accepted by `sapi config set`.
 | Variable | Default / meaning |
 |---|---|
 | `SAPI_MODEL` | Unset: pi selects the model. Otherwise passed to `pi --model`. |
-| `SAPI_PI_VERSION` | `latest`; pi version requested when building the image |
+| `SAPI_PI_VERSION` | Reviewed starting version (`1.4.0`); override the version requested for a source build. Startup updates are separate. |
 | `SAPI_AUTO_UPDATE` | `1`; `0` disables pi's update attempt on agent start |
 | `SAPI_REBUILD` | `0`; `1` rebuilds with `--no-cache --pull` |
 | `SAPI_UID` / `SAPI_GID` | Legacy compatibility controls: agent commands accept only `0`; all agents/shells start as `0:0` |
