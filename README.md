@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml/badge.svg)](https://github.com/sapiensmalti/sapi/actions/workflows/ci.yml)
 
-Simple Accessible [Pi](https://github.com/earendil-works/pi) in Docker, scoped to the directory you run it from.
+Super accessible [Pi](https://github.com/earendil-works/pi) isolated in Docker, scoped to the directory you run it from.
 
 **Version note:** this page describes `main`. Root-only execution, cgroup-based allowlisting, and published agent images are not in the installer's selected sapi release (`v0.6.1`); use the explicit development install below to get these changes.
 
@@ -20,13 +20,15 @@ Requirements: macOS or Linux, Bash, `curl`, standard Unix tools, and Docker 23+.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sapiensmalti/sapi/main/install.sh | SAPI_REF=main bash
-cd /path/to/project
+```
+The command above opts into `main`; omitting `SAPI_REF=main` installs the selected release instead. Then:
+
+```sh
+cd /path/to/target/directory
 sapi
 ```
 
-The command above opts into `main`; omitting `SAPI_REF=main` installs the selected release instead.
-
-The installer copies one executable to `~/.local/bin`, without sudo or shell-profile edits. If needed, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile. You can [read the installer](install.sh) before running it.
+The installer copies one executable to `~/.local/bin`, without sudo or shell-profile edits. If needed, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile, and run `source .bashrc` (or `source .zshrc` on Vanilla MacOS) . You can [read the installer](install.sh) before running it.
 
 First start downloads a tested, digest-pinned Linux image; later starts reuse it locally. **Pi still attempts to update on agent start by default**, so startup remains network-dependent and the running software can change. Set `SAPI_AUTO_UPDATE=0` to skip that update. See [images and builds](docs/images.md). Inside pi, use `/login` to configure a provider. Alternatively, pass an already-exported API key by name:
 
@@ -34,7 +36,7 @@ First start downloads a tested, digest-pinned Linux image; later starts reuse it
 SAPI_ENV=OPENROUTER_API_KEY sapi
 ```
 
-Pi handles model selection and authentication. Model usage is billed by your provider.
+Pi handles model selection and authentication.
 
 ## Work and recover
 
